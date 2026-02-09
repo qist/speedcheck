@@ -60,34 +60,45 @@ HTTP 探测（`http:443` 会并发尝试 HTTPS/1.x 与 HTTP/3，取更快的一�
 
 ## Build
 
-当前仓库已内置 speedcheck（见 [plugin.cfg](file:///opt/coredns/plugin.cfg#L53)），正常编译 CoreDNS 就会包含该模块。
+下面以远程仓库方式把 speedcheck 模块集成进 CoreDNS 并编译。
+
+1) 拉取 CoreDNS 源码：
 
 ~~~ txt
-make
+git clone https://github.com/coredns/coredns.git
+cd coredns
 ~~~
 
-如果你是把 speedcheck 作为新模块“集成进自己的 CoreDNS 分叉仓库”，按下面步骤：
-
-1) 在 `plugin.cfg` 增加一行（放在你希望的执行顺序位置）：
+2) 在 `plugin.cfg` 增加一行（放在你希望的执行顺序位置；顺序会影响执行链）：
 
 ~~~ txt
-speedcheck:speedcheck
+speedcheck:github.com/qist/speedcheck
 ~~~
 
-2) 重新生成插件注册代码：
+3) 拉取 speedcheck 模块源码（两种方式任选其一）：
+
+- 方式 A：让 Go 自动拉取（推荐）
+
+~~~ txt
+go get github.com/qist/speedcheck@latest
+~~~
+
+- 方式 B：手动 clone（用于固定版本或离线环境）
+
+~~~ txt
+mkdir -p plugin
+git clone https://github.com/qist/speedcheck.git plugin/speedcheck
+~~~
+
+4) 重新生成插件注册代码并编译：
 
 ~~~ txt
 go generate coredns.go
-~~~
-
-3) 编译：
-
-~~~ txt
 make
 ~~~
 
 交叉编译（Linux arm64）：
 
 ~~~ txt
-make coredns-arm64
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o coredns-linux-arm64
 ~~~
