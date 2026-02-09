@@ -1,7 +1,7 @@
 # speedcheck
 
 ## Name
-
+coredns 上游可用性探测插件返回最快IP
 speedcheck - 对上游返回的多个 IP 做探测并返回最快的一个 IP。
 
 ## Description
