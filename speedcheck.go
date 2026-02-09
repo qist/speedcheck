@@ -4,7 +4,10 @@ import (
 	"context"
 	"math/rand/v2"
 	"net"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/coredns/coredns/plugin"
 	"github.com/coredns/coredns/request"
@@ -17,9 +20,66 @@ type SpeedCheck struct {
 	cfg  config
 
 	prober ipPicker
+	cache  *ipCache
 }
 
 func (s *SpeedCheck) Name() string { return pluginName }
+
+type ipCache struct {
+	ttl time.Duration
+	mu  sync.RWMutex
+	m   map[string]cacheEntry
+}
+
+type cacheEntry struct {
+	ip        string
+	expiresAt time.Time
+}
+
+func newIPCache(ttl time.Duration) *ipCache {
+	if ttl <= 0 {
+		return nil
+	}
+	return &ipCache{ttl: ttl, m: make(map[string]cacheEntry)}
+}
+
+func cacheKey(host string, qtype uint16) string {
+	return host + "|" + strconv.Itoa(int(qtype))
+}
+
+func (c *ipCache) Get(host string, qtype uint16, now time.Time) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	k := cacheKey(host, qtype)
+
+	c.mu.RLock()
+	ent, ok := c.m[k]
+	c.mu.RUnlock()
+	if !ok {
+		return "", false
+	}
+	if now.After(ent.expiresAt) {
+		c.mu.Lock()
+		ent2, ok2 := c.m[k]
+		if ok2 && now.After(ent2.expiresAt) {
+			delete(c.m, k)
+		}
+		c.mu.Unlock()
+		return "", false
+	}
+	return ent.ip, true
+}
+
+func (c *ipCache) Set(host string, qtype uint16, ip string, now time.Time) {
+	if c == nil {
+		return
+	}
+	k := cacheKey(host, qtype)
+	c.mu.Lock()
+	c.m[k] = cacheEntry{ip: ip, expiresAt: now.Add(c.ttl)}
+	c.mu.Unlock()
+}
 
 func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 	if !s.cfg.enabled {
@@ -94,6 +154,12 @@ func (s *SpeedCheck) selectFastest(ctx context.Context, host string, qtype uint1
 		return nil
 	}
 
+	if ipStr, ok := s.cache.Get(host, qtype, time.Now()); ok {
+		if rrs, ok := rrByIP[ipStr]; ok {
+			return append(preserved, rrs...)
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.timeout)
 	defer cancel()
 
@@ -105,5 +171,6 @@ func (s *SpeedCheck) selectFastest(ctx context.Context, host string, qtype uint1
 	}
 
 	key := bestIP.String()
+	s.cache.Set(host, qtype, key, time.Now())
 	return append(preserved, rrByIP[key]...)
 }

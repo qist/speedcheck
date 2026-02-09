@@ -23,6 +23,17 @@ func (f fakeProber) pickBest(ctx context.Context, host string, pref ipPreference
 	return f.ip, f.ok
 }
 
+type countingProber struct {
+	ip    net.IP
+	ok    bool
+	count int
+}
+
+func (c *countingProber) pickBest(ctx context.Context, host string, pref ipPreference, ips []net.IP, checks []checkSpec) (net.IP, bool) {
+	c.count++
+	return c.ip, c.ok
+}
+
 type msgWriter struct {
 	test.ResponseWriter
 	msg *dns.Msg
@@ -202,6 +213,98 @@ func TestFallbackWhenAllFailed(t *testing.T) {
 	a := w.msg.Answer[0].(*dns.A).A.String()
 	if a != "1.1.1.1" && a != "2.2.2.2" {
 		t.Fatalf("unexpected fallback ip %s", a)
+	}
+}
+
+func TestCacheHitSkipsProbing(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("2.2.2.2").To4()},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	cp := &countingProber{ip: net.ParseIP("2.2.2.2").To4(), ok: true}
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled:  true,
+			checks:   []checkSpec{{kind: checkTCP, port: 80}},
+			timeout:  1 * time.Second,
+			cacheTTL: 1 * time.Second,
+		},
+		prober: cp,
+		cache:  newIPCache(1 * time.Second),
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.org.", dns.TypeA)
+
+	w1 := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w1, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	w2 := &msgWriter{}
+	_, err = sc.ServeDNS(context.Background(), w2, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if cp.count != 1 {
+		t.Fatalf("expected 1 probe due to cache hit, got %d", cp.count)
+	}
+	a := w2.msg.Answer[0].(*dns.A).A.String()
+	if a != "2.2.2.2" {
+		t.Fatalf("expected cached ip 2.2.2.2, got %s", a)
+	}
+}
+
+func TestCacheExpiryTriggersReprobe(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("2.2.2.2").To4()},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	cp := &countingProber{ip: net.ParseIP("2.2.2.2").To4(), ok: true}
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled:  true,
+			checks:   []checkSpec{{kind: checkTCP, port: 80}},
+			timeout:  1 * time.Second,
+			cacheTTL: 10 * time.Millisecond,
+		},
+		prober: cp,
+		cache:  newIPCache(10 * time.Millisecond),
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.org.", dns.TypeA)
+
+	w1 := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w1, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	time.Sleep(25 * time.Millisecond)
+	w2 := &msgWriter{}
+	_, err = sc.ServeDNS(context.Background(), w2, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if cp.count != 2 {
+		t.Fatalf("expected 2 probes due to expiry, got %d", cp.count)
 	}
 }
 

@@ -16,16 +16,18 @@ speedcheck 会对上游返回的多个 A/AAAA 记录做连通性/速度探测，
 speedcheck {
     speed-check-mode ping,tcp:80,tcp:443
     speed-timeout-mode 3s
+    speed-cache-ttl 30s
     speed-ip-mode ipv4,ipv6
     check_http_send "HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
     check_http_expect_alive http_2xx http_3xx http_4xx
 }
 ~~~
 
-- `speed-check-mode`：探测模式（`none` / `ping` / `tcp:<port>` / `http:<port>`）
+- `speed-check-mode`：探测模式（`none` / `ping` / `tcp:<port>` / `http:<port>`）；按配置顺序依次尝试，命中成功就短路；如果包含 `ping`，会先执行一次 ping
 - `speed-timeout-mode`：探测超时时间，默认 `2s`
+- `speed-cache-ttl`：缓存探测结果的时间（按域名与查询类型缓存），默认 `0`（关闭）
 - `speed-ip-mode`：IP 家族优先级（`ipv4,ipv6` / `ipv6,ipv4` / `ipv4` / `ipv6` / 不配置默认 `ipv6,ipv4`）
-- `check_http_send`：自定义 HTTP 探测报文；其中 `{host}` / `{HOST}` 会替换为当前 DNS 查询域名
+- `check_http_send`：自定义 HTTP/1.x 探测报文；其中 `{host}` / `{HOST}` 会替换为当前 DNS 查询域名；默认 `GET / HTTP/1.0\r\n\r\n`
 - `check_http_expect_alive`：HTTP 探测可接受的状态码分类（`http_2xx`/`http_3xx`/`http_4xx`/`http_5xx`/`http_all`）
 
 ## Examples
@@ -37,6 +39,7 @@ speedcheck {
     speedcheck {
         speed-check-mode ping,tcp:80,tcp:443
         speed-timeout-mode 3s
+        speed-cache-ttl 30s
         speed-ip-mode ipv6,ipv4
         check_http_send "HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
         check_http_expect_alive http_2xx http_3xx http_4xx

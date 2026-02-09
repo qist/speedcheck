@@ -45,6 +45,7 @@ type config struct {
 	checks           []checkSpec
 	ipPref           ipPreference
 	timeout          time.Duration
+	cacheTTL         time.Duration
 	httpSend         []byte
 	httpAliveClasses map[httpAliveClass]struct{}
 }
@@ -90,6 +91,14 @@ func parse(c *caddy.Controller) (*SpeedCheck, error) {
 				if err := parseSpeedTimeoutMode(&cfg, args); err != nil {
 					return nil, err
 				}
+			case "speed-cache-ttl":
+				args := c.RemainingArgs()
+				if len(args) == 0 {
+					return nil, c.ArgErr()
+				}
+				if err := parseSpeedCacheTTL(&cfg, args); err != nil {
+					return nil, err
+				}
 			case "check_http_send":
 				args := c.RemainingArgs()
 				if len(args) != 1 {
@@ -113,6 +122,7 @@ func parse(c *caddy.Controller) (*SpeedCheck, error) {
 	return &SpeedCheck{
 		cfg:    cfg,
 		prober: newDefaultProber(cfg.timeout, cfg.httpSend, cfg.httpAliveClasses),
+		cache:  newIPCache(cfg.cacheTTL),
 	}, nil
 }
 
@@ -177,6 +187,24 @@ func parseSpeedTimeoutMode(cfg *config, args []string) error {
 		return fmt.Errorf("speed-timeout-mode must be > 0")
 	}
 	cfg.timeout = d
+	return nil
+}
+
+func parseSpeedCacheTTL(cfg *config, args []string) error {
+	if len(args) == 2 && strings.EqualFold(args[0], "ttl") {
+		args = args[1:]
+	}
+	if len(args) != 1 {
+		return fmt.Errorf("invalid speed-cache-ttl %q", strings.Join(args, " "))
+	}
+	d, err := time.ParseDuration(args[0])
+	if err != nil {
+		return fmt.Errorf("invalid speed-cache-ttl %q: %w", args[0], err)
+	}
+	if d < 0 {
+		return fmt.Errorf("speed-cache-ttl must be >= 0")
+	}
+	cfg.cacheTTL = d
 	return nil
 }
 
