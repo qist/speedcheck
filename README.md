@@ -86,7 +86,7 @@ go get github.com/qist/speedcheck@latest
 - 方式 B：手动 clone（用于固定版本或离线环境）
 
 ~~~ txt
-mkdir -p plugin
+cd coredns
 git clone https://github.com/qist/speedcheck.git plugin/speedcheck
 ~~~
 
