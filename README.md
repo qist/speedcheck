@@ -84,6 +84,8 @@ speedcheck:github.com/qist/speedcheck
 
 ~~~ txt
 go get github.com/qist/speedcheck@latest
+更新到最新代码
+go get -u github.com/qist/speedcheck@latest
 ~~~
 
 - 方式 B：手动 clone（用于固定版本或离线环境）
