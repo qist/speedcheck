@@ -167,6 +167,7 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 
 	var (
 		pingSeen bool
+		pingOK   bool
 		pingDur  time.Duration
 		others   []checkSpec
 	)
@@ -180,17 +181,20 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 
 	if pingSeen {
 		start := time.Now()
-		if err := pingOnce(ctx, ip); err != nil {
-			return 0, false
+		if err := pingOnce(ctx, ip); err == nil {
+			pingOK = true
+			pingDur = time.Since(start)
 		}
-		pingDur = time.Since(start)
 	}
 
 	if len(others) == 0 {
-		if pingSeen {
+		if !pingSeen {
+			return 0, true
+		}
+		if pingOK {
 			return pingDur, true
 		}
-		return 0, true
+		return 0, false
 	}
 
 	for _, c := range others {
@@ -198,7 +202,7 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 		case checkTCP:
 			start := time.Now()
 			if err := tcpConnect(ctx, ip, c.port); err == nil {
-				if pingSeen {
+				if pingOK {
 					return pingDur, true
 				}
 				return time.Since(start), true
@@ -206,7 +210,7 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 		case checkHTTP:
 			d, err := p.httpProbe(ctx, ip, c.port, host)
 			if err == nil {
-				if pingSeen {
+				if pingOK {
 					return pingDur, true
 				}
 				return d, true

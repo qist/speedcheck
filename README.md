@@ -23,7 +23,10 @@ speedcheck {
 }
 ~~~
 
-- `speed-check-mode`：探测模式（`none` / `ping` / `tcp:<port>` / `http:<port>`）；按配置顺序依次尝试，命中成功就短路；如果包含 `ping`，会先执行一次 ping
+- `speed-check-mode`：探测模式（`none` / `ping` / `tcp:<port>` / `http:<port>`）
+  - 如果包含 `ping`：先做一次 ping；如果 ping 不通，会继续按配置顺序尝试 `tcp/http`，其中任意一个成功即短路；如果 `ping` 与所有 `tcp/http` 都失败则该 IP 失败
+  - 如果仅配置 `ping`（没有任何 `tcp/http`）：就只做 ping 探测
+  - 如果不包含 `ping`：直接按配置顺序尝试 `tcp/http`，其中任意一个成功即短路
 - `speed-timeout-mode`：探测超时时间，默认 `2s`
 - `speed-cache-ttl`：缓存探测结果的时间（按域名与查询类型缓存），默认 `0`（关闭）
 - `speed-ip-mode`：IP 家族优先级（`ipv4,ipv6` / `ipv6,ipv4` / `ipv4` / `ipv6` / 不配置默认 `ipv6,ipv4`）
