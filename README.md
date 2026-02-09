@@ -69,7 +69,7 @@ git clone https://github.com/coredns/coredns.git
 cd coredns
 ~~~
 
-2) 在 `plugin.cfg` 增加一行（放在你希望的执行顺序位置；顺序会影响执行链）：
+2) 在 `plugin.cfg` 增加一行（放在你希望的执行顺序位置；顺序会影响执行链建议放到cache:cache 前面）：
 
 ~~~ txt
 speedcheck:github.com/qist/speedcheck
