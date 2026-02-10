@@ -124,8 +124,36 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 	}
 
 	host := strings.TrimSuffix(q.Name, ".")
+	override, hasOverride := s.cfg.hostOverrides[strings.ToLower(host)]
+	if hasOverride {
+		if q.Qtype == dns.TypeAAAA && override.ipPref == ipPrefV4First {
+			speedcheckDebugf("host override force ipv4, return empty AAAA host=%s", host)
+			msg.Answer = s.dropAAAA(msg.Answer)
+			state := request.Request{W: w, Req: r}
+			state.SizeAndDo(msg)
+			_ = w.WriteMsg(msg)
+			return msg.Rcode, err
+		}
+		if q.Qtype == dns.TypeA && override.ipPref == ipPrefV6First {
+			speedcheckDebugf("host override force ipv6, return empty A host=%s", host)
+			out := make([]dns.RR, 0, len(msg.Answer))
+			for _, rr := range msg.Answer {
+				if _, ok := rr.(*dns.A); ok {
+					continue
+				}
+				out = append(out, rr)
+			}
+			msg.Answer = out
+			state := request.Request{W: w, Req: r}
+			state.SizeAndDo(msg)
+			_ = w.WriteMsg(msg)
+			return msg.Rcode, err
+		}
+	}
 	if q.Qtype == dns.TypeAAAA && s.cfg.parallelIPs {
-		if ip, ok := s.pickBestAcrossFamilies(ctx, host, msg.Answer, r, w); ok {
+		if hasOverride {
+			speedcheckDebugf("host override disables aaaa-race host=%s", host)
+		} else if ip, ok := s.pickBestAcrossFamilies(ctx, host, msg.Answer, r, w); ok {
 			speedcheckDebugf("aaaa-race winner name=%s ip=%s", q.Name, ip.String())
 			if ip.To4() != nil {
 				speedcheckDebugf("aaaa-race return empty AAAA name=%s", q.Name)
@@ -143,7 +171,20 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 		}
 	}
 
-	selected := s.selectFastest(ctx, host, q.Qtype, msg.Answer)
+	checks := s.cfg.checks
+	pref := s.cfg.ipPref
+	parallelIPs := s.cfg.parallelIPs
+	if hasOverride {
+		if override.enabled {
+			checks = override.checks
+		} else {
+			checks = nil
+		}
+		pref = override.ipPref
+		parallelIPs = false
+	}
+
+	selected := s.selectFastestWith(ctx, host, q.Qtype, msg.Answer, checks, pref, parallelIPs)
 	if selected != nil {
 		msg.Answer = selected
 	}
@@ -155,6 +196,10 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 }
 
 func (s *SpeedCheck) selectFastest(ctx context.Context, host string, qtype uint16, answer []dns.RR) []dns.RR {
+	return s.selectFastestWith(ctx, host, qtype, answer, s.cfg.checks, s.cfg.ipPref, s.cfg.parallelIPs)
+}
+
+func (s *SpeedCheck) selectFastestWith(ctx context.Context, host string, qtype uint16, answer []dns.RR, checks []checkSpec, pref ipPreference, parallelIPs bool) []dns.RR {
 	var ips []net.IP
 	var rrByIP = make(map[string][]dns.RR)
 	var preserved []dns.RR
@@ -199,11 +244,10 @@ func (s *SpeedCheck) selectFastest(ctx context.Context, host string, qtype uint1
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.timeout)
 	defer cancel()
 
-	pref := s.cfg.ipPref
-	if s.cfg.parallelIPs {
+	if parallelIPs {
 		pref = ipPrefNone
 	}
-	bestIP, ok := s.prober.pickBest(ctx, host, pref, ips, s.cfg.checks)
+	bestIP, ok := s.prober.pickBest(ctx, host, pref, ips, checks)
 	if !ok {
 		speedcheckDebugf("pickBest failed host=%s qtype=%d ips=%d", host, qtype, len(ips))
 		for _, ip := range ips {

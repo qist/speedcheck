@@ -21,6 +21,7 @@ speedcheck {
     speed-cache-ttl 30s
     speed-ip-mode ipv4,ipv6
     speed-ip-parallel off
+    speed-host-override rrs04.hw.gmcc.net,tcp:8088,ipv4
     check_http_send "HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
     check_http_expect_alive http_2xx http_3xx http_4xx
 }
@@ -36,6 +37,11 @@ speedcheck {
 - `speed-ip-mode`：IP 家族优先级（`ipv4,ipv6` / `ipv6,ipv4` / `ipv4` / `ipv6` / 不配置默认 `ipv6,ipv4`）
 - `speed-ip-parallel`：是否并发竞速 v4/v6（`on` / `off`），默认 `off`；开启后忽略 `speed-ip-mode` 的家族优先级，返回最先探测成功的 IP；当查询类型为 AAAA 且 v4 获胜时会返回空 AAAA（促使客户端回落使用 A）
 - 回落：当所有 IP 的探测都失败时，如果同时存在 IPv4/IPv6，则优先回落返回 IPv4
+- `speed-host-override`：按域名覆盖探测与 IP 家族选择（可配置多条，后写覆盖前写）
+  - 语法：`speed-host-override <host>,<check-mode>,<ipv4|ipv6>` 或 `speed-host-override <host> <check-mode> <ipv4|ipv6>`
+  - `<check-mode>` 语法与 `speed-check-mode` 相同（`none`/`ping`/`tcp:<port>`/`http:<port>`，可用逗号组合）
+  - 命中后会使用该域名专属的 check-mode 与 ip 家族选择，并禁用 `speed-ip-parallel` 的 v4/v6 竞速与 AAAA-race
+  - 强制 `ipv4` 时：对 AAAA 查询直接返回空 AAAA（促使客户端回落使用 A）；强制 `ipv6` 时：对 A 查询返回空 A
 - `check_http_send`：自定义 HTTP/1.x 探测报文；其中 `{host}` / `{HOST}` 会替换为当前 DNS 查询域名；默认 `GET / HTTP/1.0\r\n\r\n`
 - `check_http_expect_alive`：HTTP 探测可接受的状态码分类（`http_2xx`/`http_3xx`/`http_4xx`/`http_5xx`/`http_all`）
 

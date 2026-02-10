@@ -50,6 +50,13 @@ type config struct {
 	parallelIPs      bool
 	httpSend         []byte
 	httpAliveClasses map[httpAliveClass]struct{}
+	hostOverrides    map[string]hostOverride
+}
+
+type hostOverride struct {
+	enabled bool
+	checks  []checkSpec
+	ipPref  ipPreference
 }
 
 func parse(c *caddy.Controller) (*SpeedCheck, error) {
@@ -129,6 +136,14 @@ func parse(c *caddy.Controller) (*SpeedCheck, error) {
 					return nil, c.ArgErr()
 				}
 				if err := parseHTTPExpectAlive(&cfg, args); err != nil {
+					return nil, err
+				}
+			case "speed-host-override":
+				args := c.RemainingArgs()
+				if len(args) == 0 {
+					return nil, c.ArgErr()
+				}
+				if err := parseSpeedHostOverride(&cfg, args); err != nil {
 					return nil, err
 				}
 			default:
@@ -385,4 +400,64 @@ func parsePort(s string) (uint16, error) {
 		return 0, fmt.Errorf("invalid port %q", s)
 	}
 	return uint16(p), nil
+}
+
+func parseSpeedHostOverride(cfg *config, args []string) error {
+	type entry struct {
+		host      string
+		checkMode string
+		ipMode    string
+	}
+
+	var entries []entry
+	if len(args) >= 1 && strings.Count(args[0], ",") >= 2 {
+		for _, a := range args {
+			if strings.Count(a, ",") < 2 {
+				return fmt.Errorf("invalid speed-host-override %q", strings.Join(args, " "))
+			}
+			parts := strings.SplitN(a, ",", 3)
+			entries = append(entries, entry{
+				host:      strings.TrimSpace(parts[0]),
+				checkMode: strings.TrimSpace(parts[1]),
+				ipMode:    strings.TrimSpace(parts[2]),
+			})
+		}
+	} else if len(args) == 3 {
+		entries = append(entries, entry{host: args[0], checkMode: args[1], ipMode: args[2]})
+	} else {
+		return fmt.Errorf("invalid speed-host-override %q", strings.Join(args, " "))
+	}
+
+	if cfg.hostOverrides == nil {
+		cfg.hostOverrides = make(map[string]hostOverride, 8)
+	}
+
+	for _, e := range entries {
+		host := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(e.host)), ".")
+		if host == "" {
+			return fmt.Errorf("invalid speed-host-override host %q", e.host)
+		}
+
+		checks, enabled, err := parseSpeedCheckMode([]string{e.checkMode})
+		if err != nil {
+			return fmt.Errorf("invalid speed-host-override check-mode for host %q: %w", host, err)
+		}
+
+		var pref ipPreference
+		switch strings.ToLower(strings.TrimSpace(e.ipMode)) {
+		case "ipv4", "v4":
+			pref = ipPrefV4First
+		case "ipv6", "v6":
+			pref = ipPrefV6First
+		default:
+			return fmt.Errorf("invalid speed-host-override ip-mode %q for host %q", e.ipMode, host)
+		}
+
+		cfg.hostOverrides[host] = hostOverride{
+			enabled: enabled,
+			checks:  checks,
+			ipPref:  pref,
+		}
+	}
+	return nil
 }

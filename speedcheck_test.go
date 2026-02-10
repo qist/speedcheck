@@ -45,6 +45,23 @@ func (c *capturePrefProber) pickBest(ctx context.Context, host string, pref ipPr
 	return c.ip, c.ok
 }
 
+type captureChecksProber struct {
+	checks []checkSpec
+	ip     net.IP
+	ok     bool
+}
+
+func (c *captureChecksProber) pickBest(ctx context.Context, host string, pref ipPreference, ips []net.IP, checks []checkSpec) (net.IP, bool) {
+	c.checks = append([]checkSpec(nil), checks...)
+	return c.ip, c.ok
+}
+
+type ipPickerFunc func(ctx context.Context, host string, pref ipPreference, ips []net.IP, checks []checkSpec) (net.IP, bool)
+
+func (f ipPickerFunc) pickBest(ctx context.Context, host string, pref ipPreference, ips []net.IP, checks []checkSpec) (net.IP, bool) {
+	return f(ctx, host, pref, ips, checks)
+}
+
 type msgWriter struct {
 	test.ResponseWriter
 	msg *dns.Msg
@@ -63,6 +80,7 @@ speedcheck {
   speed-check-mode ping,tcp:80,http:443
   speed-ip-mode ipv6,ipv4
   speed-timeout-mode 3s
+  speed-host-override rrs04.hw.gmcc.net,tcp:8088,ipv4
   check_http_expect_alive http_2xx http_3xx http_5xx
 }
 `)
@@ -84,6 +102,13 @@ speedcheck {
 	}
 	if _, ok := sc.cfg.httpAliveClasses[httpAlive5xx]; !ok {
 		t.Fatalf("expected http_5xx enabled")
+	}
+	ov, ok := sc.cfg.hostOverrides["rrs04.hw.gmcc.net"]
+	if !ok {
+		t.Fatalf("expected host override")
+	}
+	if !ov.enabled || ov.ipPref != ipPrefV4First || len(ov.checks) != 1 || ov.checks[0].kind != checkTCP || ov.checks[0].port != 8088 {
+		t.Fatalf("unexpected host override: %#v", ov)
 	}
 }
 
@@ -685,4 +710,132 @@ func TestProbeIPParallelChecksCanSucceedBeforeTimeout(t *testing.T) {
 
 	<-slowDone
 	<-fastDone
+}
+
+func TestHTTPRedirectLocationIPFamilyMismatch(t *testing.T) {
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer l.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_ = c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		_, _ = c.Read(make([]byte, 2048))
+		_, _ = c.Write([]byte("HTTP/1.1 302 Found\r\nLocation: http://[::1]:8088/x\r\n\r\n"))
+	}()
+
+	ip := net.ParseIP("127.0.0.1").To4()
+	port := uint16(l.Addr().(*net.TCPAddr).Port)
+
+	p := newDefaultProber(1*time.Second, false, nil, nil)
+	_, err = p.httpProbe(context.Background(), ip, port, "example.org")
+	if err == nil {
+		t.Fatalf("expected redirect ip-family mismatch to fail")
+	}
+
+	<-done
+}
+
+func TestHostOverrideForceIPv4ReturnsEmptyAAAAWithoutProbing(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::1")},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	cp := &countingProber{ip: net.ParseIP("1.1.1.1").To4(), ok: true}
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled: true,
+			hostOverrides: map[string]hostOverride{
+				"rrs04.hw.gmcc.net": {
+					enabled: true,
+					checks:  []checkSpec{{kind: checkTCP, port: 8088}},
+					ipPref:  ipPrefV4First,
+				},
+			},
+		},
+		prober: cp,
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("rrs04.hw.gmcc.net.", dns.TypeAAAA)
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if w.msg == nil {
+		t.Fatalf("expected response")
+	}
+	if len(w.msg.Answer) != 0 {
+		t.Fatalf("expected empty AAAA answer, got %d", len(w.msg.Answer))
+	}
+	if cp.count != 0 {
+		t.Fatalf("expected no probing, got %d", cp.count)
+	}
+}
+
+func TestHostOverrideUsesCustomChecksAndForcesNoParallelIPs(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.2").To4()},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	cp := &capturePrefProber{ip: net.ParseIP("1.1.1.1").To4(), ok: true}
+	cc := &captureChecksProber{ip: net.ParseIP("1.1.1.1").To4(), ok: true}
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled:     true,
+			parallelIPs: true,
+			ipPref:      ipPrefV6First,
+			checks:      []checkSpec{{kind: checkTCP, port: 80}},
+			hostOverrides: map[string]hostOverride{
+				"rrs04.hw.gmcc.net": {
+					enabled: true,
+					checks:  []checkSpec{{kind: checkTCP, port: 8088}},
+					ipPref:  ipPrefV4First,
+				},
+			},
+		},
+		prober: ipPickerFunc(func(ctx context.Context, host string, pref ipPreference, ips []net.IP, checks []checkSpec) (net.IP, bool) {
+			_, _ = cp.pickBest(ctx, host, pref, ips, checks)
+			_, _ = cc.pickBest(ctx, host, pref, ips, checks)
+			return net.ParseIP("1.1.1.1").To4(), true
+		}),
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("rrs04.hw.gmcc.net.", dns.TypeA)
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if cp.pref != ipPrefV4First {
+		t.Fatalf("expected override pref v4first, got %v", cp.pref)
+	}
+	if len(cc.checks) != 1 || cc.checks[0].kind != checkTCP || cc.checks[0].port != 8088 {
+		t.Fatalf("expected override checks tcp:8088, got %#v", cc.checks)
+	}
 }

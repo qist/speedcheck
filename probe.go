@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
@@ -532,6 +533,48 @@ func httpSendBytes(httpSend []byte, host string) []byte {
 	return []byte(s)
 }
 
+func redirectLocationIPFamilyMismatch(location string, probedIP net.IP) bool {
+	if location == "" || probedIP == nil {
+		return false
+	}
+
+	u, err := url.Parse(location)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	locIP := net.ParseIP(host)
+	if locIP == nil {
+		return false
+	}
+	return (locIP.To4() == nil) != (probedIP.To4() == nil)
+}
+
+func readLocationHeader(br *bufio.Reader) (string, error) {
+	for i := 0; i < 64; i++ {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return "", err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			return "", nil
+		}
+
+		k, v, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(k), "Location") {
+			return strings.TrimSpace(v), nil
+		}
+	}
+	return "", nil
+}
+
 func (p *prober) httpProbe(ctx context.Context, ip net.IP, port uint16, host string) (time.Duration, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -624,6 +667,12 @@ func (p *prober) http1Probe(ctx context.Context, ip net.IP, port uint16, host st
 	if !p.httpStatusAlive(code) {
 		return 0, fmt.Errorf("http status %d not alive", code)
 	}
+	if code/100 == 3 {
+		loc, err := readLocationHeader(br)
+		if err == nil && redirectLocationIPFamilyMismatch(loc, ip) {
+			return 0, fmt.Errorf("http redirect location ip-family mismatch location=%q", loc)
+		}
+	}
 	return time.Since(start), nil
 }
 
@@ -647,6 +696,9 @@ func (p *prober) http3Probe(ctx context.Context, ip net.IP, port uint16, host st
 
 	client := &http.Client{
 		Transport: tr,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
@@ -663,6 +715,9 @@ func (p *prober) http3Probe(ctx context.Context, ip net.IP, port uint16, host st
 
 	if !p.httpStatusAlive(resp.StatusCode) {
 		return 0, fmt.Errorf("http3 status %d not alive", resp.StatusCode)
+	}
+	if resp.StatusCode/100 == 3 && redirectLocationIPFamilyMismatch(resp.Header.Get("Location"), ip) {
+		return 0, fmt.Errorf("http3 redirect location ip-family mismatch location=%q", resp.Header.Get("Location"))
 	}
 	return time.Since(start), nil
 }
