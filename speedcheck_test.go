@@ -621,6 +621,73 @@ func TestProbeIPShortCircuitTriesNextAfterFailure(t *testing.T) {
 	}
 }
 
+func TestProbeIPCanceledContextStillProbesTCP(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer l.Close()
+
+	port := uint16(l.Addr().(*net.TCPAddr).Port)
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		_ = l.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Second))
+		c, err := l.Accept()
+		if err == nil {
+			_ = c.Close()
+		}
+	}()
+
+	p := newDefaultProber(500*time.Millisecond, false, nil, nil)
+	ip := net.ParseIP("127.0.0.1").To4()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, ok := p.probeIP(ctx, ip, "example.org", []checkSpec{{kind: checkTCP, port: port}})
+	if !ok {
+		t.Fatalf("expected ok")
+	}
+	<-acceptDone
+}
+
+func TestProbeIPCanceledContextStillProbesHTTP(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer l.Close()
+
+	port := uint16(l.Addr().(*net.TCPAddr).Port)
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		_ = l.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Second))
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(1 * time.Second))
+		buf := make([]byte, 1024)
+		_, _ = c.Read(buf)
+		_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
+	}()
+
+	p := newDefaultProber(500*time.Millisecond, false, nil, nil)
+	ip := net.ParseIP("127.0.0.1").To4()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, ok := p.probeIP(ctx, ip, "example.org", []checkSpec{{kind: checkHTTP, port: port}})
+	if !ok {
+		t.Fatalf("expected ok")
+	}
+	<-acceptDone
+}
+
 func TestProbeIPParallelChecksCanSucceedBeforeTimeout(t *testing.T) {
 	slowL, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
