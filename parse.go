@@ -47,6 +47,7 @@ type config struct {
 	timeout          time.Duration
 	cacheTTL         time.Duration
 	parallelChecks   bool
+	parallelIPs      bool
 	httpSend         []byte
 	httpAliveClasses map[httpAliveClass]struct{}
 }
@@ -82,6 +83,14 @@ func parse(c *caddy.Controller) (*SpeedCheck, error) {
 					return nil, c.ArgErr()
 				}
 				if err := parseSpeedIPMode(&cfg, args); err != nil {
+					return nil, err
+				}
+			case "speed-ip-parallel":
+				args := c.RemainingArgs()
+				if len(args) == 0 {
+					return nil, c.ArgErr()
+				}
+				if err := parseSpeedIPParallel(&cfg, args); err != nil {
 					return nil, err
 				}
 			case "speed-timeout-mode":
@@ -317,6 +326,25 @@ func parseSpeedIPMode(cfg *config, args []string) error {
 		return nil
 	}
 	return fmt.Errorf("invalid speed-ip-mode %q", strings.Join(args, " "))
+}
+
+func parseSpeedIPParallel(cfg *config, args []string) error {
+	if len(args) == 2 && strings.EqualFold(args[0], "parallel") {
+		args = args[1:]
+	}
+	if len(args) != 1 {
+		return fmt.Errorf("invalid speed-ip-parallel %q", strings.Join(args, " "))
+	}
+	switch strings.ToLower(strings.TrimSpace(args[0])) {
+	case "on", "true", "1", "yes":
+		cfg.parallelIPs = true
+		return nil
+	case "off", "false", "0", "no":
+		cfg.parallelIPs = false
+		return nil
+	default:
+		return fmt.Errorf("invalid speed-ip-parallel %q", args[0])
+	}
 }
 
 func parseHTTPExpectAlive(cfg *config, args []string) error {

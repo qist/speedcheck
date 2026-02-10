@@ -163,7 +163,11 @@ func (s *SpeedCheck) selectFastest(ctx context.Context, host string, qtype uint1
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.timeout)
 	defer cancel()
 
-	bestIP, ok := s.prober.pickBest(ctx, host, s.cfg.ipPref, ips, s.cfg.checks)
+	pref := s.cfg.ipPref
+	if s.cfg.parallelIPs {
+		pref = ipPrefNone
+	}
+	bestIP, ok := s.prober.pickBest(ctx, host, pref, ips, s.cfg.checks)
 	if !ok {
 		for _, ip := range ips {
 			if ip.To4() != nil {

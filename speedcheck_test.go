@@ -34,6 +34,17 @@ func (c *countingProber) pickBest(ctx context.Context, host string, pref ipPrefe
 	return c.ip, c.ok
 }
 
+type capturePrefProber struct {
+	pref ipPreference
+	ip   net.IP
+	ok   bool
+}
+
+func (c *capturePrefProber) pickBest(ctx context.Context, host string, pref ipPreference, ips []net.IP, checks []checkSpec) (net.IP, bool) {
+	c.pref = pref
+	return c.ip, c.ok
+}
+
 type msgWriter struct {
 	test.ResponseWriter
 	msg *dns.Msg
@@ -127,6 +138,60 @@ speedcheck {
 	}
 	if !p.parallelChecks {
 		t.Fatalf("expected prober parallelChecks enabled")
+	}
+}
+
+func TestParseSpeedIPParallel(t *testing.T) {
+	c := caddy.NewTestController("dns", `
+speedcheck {
+  speed-check-mode tcp:80
+  speed-ip-parallel on
+}
+`)
+	sc, err := parse(c)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if !sc.cfg.parallelIPs {
+		t.Fatalf("expected parallelIPs enabled")
+	}
+}
+
+func TestSpeedIPParallelForcesRaceMode(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::1")},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	cp := &capturePrefProber{ip: net.ParseIP("1.1.1.1").To4(), ok: true}
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled:     true,
+			checks:      []checkSpec{{kind: checkTCP, port: 80}},
+			timeout:     1 * time.Second,
+			ipPref:      ipPrefV6First,
+			parallelIPs: true,
+		},
+		prober: cp,
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.org.", dns.TypeANY)
+
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if cp.pref != ipPrefNone {
+		t.Fatalf("expected pref forced to none in ip-parallel mode, got %v", cp.pref)
 	}
 }
 
