@@ -2,8 +2,10 @@ package speedcheck
 
 import (
 	"context"
+	"fmt"
 	"math/rand/v2"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +26,15 @@ type SpeedCheck struct {
 }
 
 func (s *SpeedCheck) Name() string { return pluginName }
+
+var speedcheckDebug = os.Getenv("SPEEDCHECK_DEBUG") != ""
+
+func speedcheckDebugf(format string, args ...interface{}) {
+	if !speedcheckDebug {
+		return
+	}
+	_, _ = fmt.Fprintf(os.Stderr, "speedcheck-debug: "+format+"\n", args...)
+}
 
 type ipCache struct {
 	ttl time.Duration
@@ -94,14 +105,18 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 		return plugin.NextOrFailure(s.Name(), s.Next, ctx, w, r)
 	}
 
+	speedcheckDebugf("query name=%s qtype=%d parallelChecks=%t parallelIPs=%t ipPref=%d timeout=%s", q.Name, q.Qtype, s.cfg.parallelChecks, s.cfg.parallelIPs, s.cfg.ipPref, s.cfg.timeout)
+
 	cw := newCaptureWriter(w)
 	rcode, err := plugin.NextOrFailure(s.Name(), s.Next, ctx, cw, r)
 	if cw.Msg == nil {
+		speedcheckDebugf("upstream no message name=%s qtype=%d rcode=%d err=%v", q.Name, q.Qtype, rcode, err)
 		return rcode, err
 	}
 
 	msg := cw.Msg.Copy()
 	if msg.Rcode != dns.RcodeSuccess {
+		speedcheckDebugf("upstream non-success name=%s qtype=%d rcode=%d", q.Name, q.Qtype, msg.Rcode)
 		state := request.Request{W: w, Req: r}
 		state.SizeAndDo(msg)
 		_ = w.WriteMsg(msg)
@@ -111,7 +126,9 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 	host := strings.TrimSuffix(q.Name, ".")
 	if q.Qtype == dns.TypeAAAA && s.cfg.parallelIPs {
 		if ip, ok := s.pickBestAcrossFamilies(ctx, host, msg.Answer, r, w); ok {
+			speedcheckDebugf("aaaa-race winner name=%s ip=%s", q.Name, ip.String())
 			if ip.To4() != nil {
+				speedcheckDebugf("aaaa-race return empty AAAA name=%s", q.Name)
 				msg.Answer = s.dropAAAA(msg.Answer)
 			} else {
 				selected := s.selectFastest(ctx, host, q.Qtype, msg.Answer)
@@ -125,6 +142,7 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 			return msg.Rcode, err
 		}
 	}
+
 	selected := s.selectFastest(ctx, host, q.Qtype, msg.Answer)
 	if selected != nil {
 		msg.Answer = selected
@@ -167,11 +185,13 @@ func (s *SpeedCheck) selectFastest(ctx context.Context, host string, qtype uint1
 	}
 
 	if len(ips) == 0 {
+		speedcheckDebugf("no ips host=%s qtype=%d", host, qtype)
 		return nil
 	}
 
 	if ipStr, ok := s.cache.Get(host, qtype, time.Now()); ok {
 		if rrs, ok := rrByIP[ipStr]; ok {
+			speedcheckDebugf("cache hit host=%s qtype=%d ip=%s", host, qtype, ipStr)
 			return append(preserved, rrs...)
 		}
 	}
@@ -185,19 +205,23 @@ func (s *SpeedCheck) selectFastest(ctx context.Context, host string, qtype uint1
 	}
 	bestIP, ok := s.prober.pickBest(ctx, host, pref, ips, s.cfg.checks)
 	if !ok {
+		speedcheckDebugf("pickBest failed host=%s qtype=%d ips=%d", host, qtype, len(ips))
 		for _, ip := range ips {
 			if ip.To4() != nil {
 				key := ip.String()
+				speedcheckDebugf("fallback pick first v4 host=%s qtype=%d ip=%s", host, qtype, key)
 				return append(preserved, rrByIP[key]...)
 			}
 		}
 		ip := ips[rand.IntN(len(ips))]
 		key := ip.String()
+		speedcheckDebugf("fallback pick random host=%s qtype=%d ip=%s", host, qtype, key)
 		return append(preserved, rrByIP[key]...)
 	}
 
 	key := bestIP.String()
 	s.cache.Set(host, qtype, key, time.Now())
+	speedcheckDebugf("pickBest ok host=%s qtype=%d ip=%s", host, qtype, key)
 	return append(preserved, rrByIP[key]...)
 }
 
@@ -210,10 +234,12 @@ func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aa
 	}
 
 	if len(ips) == 0 {
+		speedcheckDebugf("aaaa-race no v6 ips host=%s", host)
 		return nil, false
 	}
 
 	if r == nil || len(r.Question) == 0 {
+		speedcheckDebugf("aaaa-race missing request host=%s", host)
 		return nil, false
 	}
 
@@ -223,6 +249,7 @@ func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aa
 	cw := newCaptureWriter(w)
 	rcode, _ := plugin.NextOrFailure(s.Name(), s.Next, ctx, cw, reqA)
 	if cw.Msg == nil || rcode != dns.RcodeSuccess || cw.Msg.Rcode != dns.RcodeSuccess {
+		speedcheckDebugf("aaaa-race upstream A failed host=%s rcode=%d msg=%v", host, rcode, cw.Msg != nil)
 		return nil, false
 	}
 
@@ -234,12 +261,14 @@ func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aa
 		}
 	}
 	if !hasV4 {
+		speedcheckDebugf("aaaa-race no v4 ips host=%s", host)
 		return nil, false
 	}
 
 	ctx2, cancel := context.WithTimeout(ctx, s.cfg.timeout)
 	defer cancel()
 
+	speedcheckDebugf("aaaa-race probing host=%s ips=%d", host, len(ips))
 	return s.prober.pickBest(ctx2, host, ipPrefNone, ips, s.cfg.checks)
 }
 
