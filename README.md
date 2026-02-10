@@ -34,7 +34,7 @@ speedcheck {
 - `speed-check-parallel`：是否并发执行同一 IP 的 `tcp/http` 探测（`on` / `off`），默认 `off`；开启后会在任意一个 `tcp/http` 成功时短路返回
 - `speed-cache-ttl`：缓存探测结果的时间（按域名与查询类型缓存），默认 `0`（关闭）
 - `speed-ip-mode`：IP 家族优先级（`ipv4,ipv6` / `ipv6,ipv4` / `ipv4` / `ipv6` / 不配置默认 `ipv6,ipv4`）
-- `speed-ip-parallel`：是否并发竞速 v4/v6（`on` / `off`），默认 `off`；开启后忽略 `speed-ip-mode` 的家族优先级，返回最先探测成功的 IP
+- `speed-ip-parallel`：是否并发竞速 v4/v6（`on` / `off`），默认 `off`；开启后忽略 `speed-ip-mode` 的家族优先级，返回最先探测成功的 IP；当查询类型为 AAAA 且 v4 获胜时会返回空 AAAA（促使客户端回落使用 A）
 - 回落：当所有 IP 的探测都失败时，如果同时存在 IPv4/IPv6，则优先回落返回 IPv4
 - `check_http_send`：自定义 HTTP/1.x 探测报文；其中 `{host}` / `{HOST}` 会替换为当前 DNS 查询域名；默认 `GET / HTTP/1.0\r\n\r\n`
 - `check_http_expect_alive`：HTTP 探测可接受的状态码分类（`http_2xx`/`http_3xx`/`http_4xx`/`http_5xx`/`http_all`）

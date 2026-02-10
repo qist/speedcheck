@@ -109,6 +109,22 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 	}
 
 	host := strings.TrimSuffix(q.Name, ".")
+	if q.Qtype == dns.TypeAAAA && s.cfg.parallelIPs {
+		if ip, ok := s.pickBestAcrossFamilies(ctx, host, msg.Answer, r, w); ok {
+			if ip.To4() != nil {
+				msg.Answer = s.dropAAAA(msg.Answer)
+			} else {
+				selected := s.selectFastest(ctx, host, q.Qtype, msg.Answer)
+				if selected != nil {
+					msg.Answer = selected
+				}
+			}
+			state := request.Request{W: w, Req: r}
+			state.SizeAndDo(msg)
+			_ = w.WriteMsg(msg)
+			return msg.Rcode, err
+		}
+	}
 	selected := s.selectFastest(ctx, host, q.Qtype, msg.Answer)
 	if selected != nil {
 		msg.Answer = selected
@@ -183,4 +199,57 @@ func (s *SpeedCheck) selectFastest(ctx context.Context, host string, qtype uint1
 	key := bestIP.String()
 	s.cache.Set(host, qtype, key, time.Now())
 	return append(preserved, rrByIP[key]...)
+}
+
+func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aaaaAnswer []dns.RR, r *dns.Msg, w dns.ResponseWriter) (net.IP, bool) {
+	var ips []net.IP
+	for _, rr := range aaaaAnswer {
+		if a, ok := rr.(*dns.AAAA); ok {
+			ips = append(ips, a.AAAA)
+		}
+	}
+
+	if len(ips) == 0 {
+		return nil, false
+	}
+
+	if r == nil || len(r.Question) == 0 {
+		return nil, false
+	}
+
+	reqA := r.Copy()
+	reqA.Question[0].Qtype = dns.TypeA
+
+	cw := newCaptureWriter(w)
+	rcode, _ := plugin.NextOrFailure(s.Name(), s.Next, ctx, cw, reqA)
+	if cw.Msg == nil || rcode != dns.RcodeSuccess || cw.Msg.Rcode != dns.RcodeSuccess {
+		return nil, false
+	}
+
+	hasV4 := false
+	for _, rr := range cw.Msg.Answer {
+		if a, ok := rr.(*dns.A); ok && a.A != nil {
+			hasV4 = true
+			ips = append(ips, a.A)
+		}
+	}
+	if !hasV4 {
+		return nil, false
+	}
+
+	ctx2, cancel := context.WithTimeout(ctx, s.cfg.timeout)
+	defer cancel()
+
+	return s.prober.pickBest(ctx2, host, ipPrefNone, ips, s.cfg.checks)
+}
+
+func (s *SpeedCheck) dropAAAA(answer []dns.RR) []dns.RR {
+	out := make([]dns.RR, 0, len(answer))
+	for _, rr := range answer {
+		if _, ok := rr.(*dns.AAAA); ok {
+			continue
+		}
+		out = append(out, rr)
+	}
+	return out
 }
