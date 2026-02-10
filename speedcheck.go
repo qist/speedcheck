@@ -196,11 +196,7 @@ func (s *SpeedCheck) selectFastest(ctx context.Context, host string, qtype uint1
 		}
 	}
 
-	baseCtx := context.Background()
-	if ctx != nil {
-		baseCtx = context.WithoutCancel(ctx)
-	}
-	ctx, cancel := context.WithTimeout(baseCtx, s.cfg.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.timeout)
 	defer cancel()
 
 	pref := s.cfg.ipPref
@@ -273,7 +269,7 @@ func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aa
 		return nil, false
 	}
 
-	ctx2, cancel := context.WithTimeout(baseCtx, s.cfg.timeout)
+	ctx2, cancel := context.WithTimeout(context.Background(), s.cfg.timeout)
 	defer cancel()
 
 	speedcheckDebugf("aaaa-race probing host=%s ips=%d", host, len(ips))
