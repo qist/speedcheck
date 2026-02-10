@@ -393,6 +393,50 @@ func TestAAAAQueryParallelIPCanReturnEmptyAAAA(t *testing.T) {
 	}
 }
 
+func TestAAAAQueryParallelIPProbeFailStillReturnsEmptyAAAA(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		switch r.Question[0].Qtype {
+		case dns.TypeA:
+			m.Answer = []dns.RR{
+				&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+			}
+		case dns.TypeAAAA:
+			m.Answer = []dns.RR{
+				&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::1")},
+			}
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled:     true,
+			timeout:     1 * time.Second,
+			parallelIPs: true,
+		},
+		prober: fakeProber{ip: nil, ok: false},
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.org.", dns.TypeAAAA)
+
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if w.msg == nil {
+		t.Fatalf("expected response")
+	}
+	if len(w.msg.Answer) != 0 {
+		t.Fatalf("expected empty AAAA answer, got %d", len(w.msg.Answer))
+	}
+}
+
 func TestCacheHitSkipsProbing(t *testing.T) {
 	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 		m := new(dns.Msg)

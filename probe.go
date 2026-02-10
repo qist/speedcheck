@@ -45,9 +45,23 @@ func newDefaultProber(timeout time.Duration, parallelChecks bool, httpSend []byt
 
 type probeResult struct {
 	kind checkKind
+	port uint16
 	d    time.Duration
 	ok   bool
 	err  error
+}
+
+func checkKindName(k checkKind) string {
+	switch k {
+	case checkPing:
+		return "ping"
+	case checkTCP:
+		return "tcp"
+	case checkHTTP:
+		return "http"
+	default:
+		return "unknown"
+	}
 }
 
 func (p *prober) pickBest(ctx context.Context, host string, pref ipPreference, ips []net.IP, checks []checkSpec) (net.IP, bool) {
@@ -211,12 +225,17 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 				case checkTCP:
 					start := time.Now()
 					err := tcpConnect(ctx2, ip, c.port)
-					resultCh <- probeResult{kind: c.kind, d: time.Since(start), ok: err == nil, err: err}
+					d := time.Since(start)
+					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, err)
+					resultCh <- probeResult{kind: c.kind, port: c.port, d: d, ok: err == nil, err: err}
 				case checkHTTP:
 					d, err := p.httpProbe(ctx2, ip, c.port, host)
-					resultCh <- probeResult{kind: c.kind, d: d, ok: err == nil, err: err}
+					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, err)
+					resultCh <- probeResult{kind: c.kind, port: c.port, d: d, ok: err == nil, err: err}
 				default:
-					resultCh <- probeResult{kind: c.kind, ok: false, err: errors.New("unknown check kind")}
+					err := errors.New("unknown check kind")
+					speedcheckDebugf("check host=%s ip=%s kind=%s ok=%t err=%v", host, ip.String(), checkKindName(c.kind), false, err)
+					resultCh <- probeResult{kind: c.kind, ok: false, err: err}
 				}
 			}()
 		}
@@ -244,18 +263,24 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 			case checkTCP:
 				start := time.Now()
 				if err := tcpConnect(ctx, ip, c.port); err == nil {
+					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, true, time.Since(start), nil)
 					if pingOK {
 						return pingDur, true
 					}
 					return time.Since(start), true
+				} else {
+					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, false, time.Since(start), err)
 				}
 			case checkHTTP:
 				d, err := p.httpProbe(ctx, ip, c.port, host)
 				if err == nil {
+					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, true, d, nil)
 					if pingOK {
 						return pingDur, true
 					}
 					return d, true
+				} else {
+					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, false, d, err)
 				}
 			default:
 				return 0, false

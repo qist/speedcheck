@@ -269,7 +269,17 @@ func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aa
 	defer cancel()
 
 	speedcheckDebugf("aaaa-race probing host=%s ips=%d", host, len(ips))
-	return s.prober.pickBest(ctx2, host, ipPrefNone, ips, s.cfg.checks)
+	best, ok := s.prober.pickBest(ctx2, host, ipPrefNone, ips, s.cfg.checks)
+	if ok {
+		return best, true
+	}
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			speedcheckDebugf("aaaa-race probe failed, force v4 host=%s ip=%s", host, ip.String())
+			return ip, true
+		}
+	}
+	return nil, false
 }
 
 func (s *SpeedCheck) dropAAAA(answer []dns.RR) []dns.RR {
