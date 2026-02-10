@@ -51,25 +51,6 @@ type probeResult struct {
 	err  error
 }
 
-func newProbeContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	probeCtx, cancel := context.WithTimeout(context.Background(), timeout)
-	if ctx == nil {
-		return probeCtx, cancel
-	}
-	done := ctx.Done()
-	if done == nil {
-		return probeCtx, cancel
-	}
-	go func() {
-		select {
-		case <-done:
-			cancel()
-		case <-probeCtx.Done():
-		}
-	}()
-	return probeCtx, cancel
-}
-
 func checkKindName(k checkKind) string {
 	switch k {
 	case checkPing:
@@ -88,11 +69,7 @@ func (p *prober) pickBest(ctx context.Context, host string, pref ipPreference, i
 		return nil, false
 	}
 
-	baseCtx := context.Background()
-	if ctx != nil {
-		baseCtx = context.WithoutCancel(ctx)
-	}
-	ctx, cancel := context.WithCancel(baseCtx)
+	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
 	defer cancel()
 
 	type outcome struct {
@@ -201,9 +178,9 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 		return 0, true
 	}
 
-	baseCtx := context.Background()
-	if ctx != nil {
-		baseCtx = context.WithoutCancel(ctx)
+	baseCtx := ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
 	}
 	ctx, cancel := context.WithTimeout(baseCtx, p.timeout)
 	defer cancel()
@@ -434,7 +411,11 @@ func httpSendBytes(httpSend []byte, host string) []byte {
 }
 
 func (p *prober) httpProbe(ctx context.Context, ip net.IP, port uint16, host string) (time.Duration, error) {
-	ctx, cancel := newProbeContext(ctx, p.timeout)
+	baseCtx := ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, p.timeout)
 	defer cancel()
 	if port == 443 {
 		ctx, cancel := context.WithCancel(ctx)

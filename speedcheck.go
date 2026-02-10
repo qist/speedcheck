@@ -247,11 +247,9 @@ func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aa
 	reqA.Question[0].Qtype = dns.TypeA
 
 	cw := newCaptureWriter(w)
-	baseCtx := context.Background()
-	if ctx != nil {
-		baseCtx = context.WithoutCancel(ctx)
-	}
-	rcode, _ := plugin.NextOrFailure(s.Name(), s.Next, baseCtx, cw, reqA)
+	ctxA, cancelA := context.WithTimeout(context.Background(), s.cfg.timeout)
+	defer cancelA()
+	rcode, _ := plugin.NextOrFailure(s.Name(), s.Next, ctxA, cw, reqA)
 	if cw.Msg == nil || rcode != dns.RcodeSuccess || cw.Msg.Rcode != dns.RcodeSuccess {
 		speedcheckDebugf("aaaa-race upstream A failed host=%s rcode=%d msg=%v", host, rcode, cw.Msg != nil)
 		return nil, false
