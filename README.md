@@ -31,6 +31,7 @@ speedcheck {
 - `speed-timeout-mode`：探测超时时间，默认 `2s`
 - `speed-cache-ttl`：缓存探测结果的时间（按域名与查询类型缓存），默认 `0`（关闭）
 - `speed-ip-mode`：IP 家族优先级（`ipv4,ipv6` / `ipv6,ipv4` / `ipv4` / `ipv6` / 不配置默认 `ipv6,ipv4`）
+- 回落：当所有 IP 的探测都失败时，如果同时存在 IPv4/IPv6，则优先回落返回 IPv4
 - `check_http_send`：自定义 HTTP/1.x 探测报文；其中 `{host}` / `{HOST}` 会替换为当前 DNS 查询域名；默认 `GET / HTTP/1.0\r\n\r\n`
 - `check_http_expect_alive`：HTTP 探测可接受的状态码分类（`http_2xx`/`http_3xx`/`http_4xx`/`http_5xx`/`http_all`）
 

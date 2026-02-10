@@ -216,6 +216,51 @@ func TestFallbackWhenAllFailed(t *testing.T) {
 	}
 }
 
+func TestFallbackWhenAllFailedPrefersV4(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::1")},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled: true,
+			checks:  []checkSpec{{kind: checkTCP, port: 80}},
+			timeout: 1 * time.Second,
+		},
+		prober: fakeProber{ip: nil, ok: false},
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.org.", dns.TypeANY)
+
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if w.msg == nil {
+		t.Fatalf("expected response")
+	}
+	if len(w.msg.Answer) != 1 {
+		t.Fatalf("expected 1 answer, got %d", len(w.msg.Answer))
+	}
+	a, ok := w.msg.Answer[0].(*dns.A)
+	if !ok {
+		t.Fatalf("expected A record fallback, got %T", w.msg.Answer[0])
+	}
+	if got := a.A.String(); got != "1.1.1.1" {
+		t.Fatalf("expected 1.1.1.1, got %s", got)
+	}
+}
+
 func TestCacheHitSkipsProbing(t *testing.T) {
 	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 		m := new(dns.Msg)

@@ -165,6 +165,12 @@ func (s *SpeedCheck) selectFastest(ctx context.Context, host string, qtype uint1
 
 	bestIP, ok := s.prober.pickBest(ctx, host, s.cfg.ipPref, ips, s.cfg.checks)
 	if !ok {
+		for _, ip := range ips {
+			if ip.To4() != nil {
+				key := ip.String()
+				return append(preserved, rrByIP[key]...)
+			}
+		}
 		ip := ips[rand.IntN(len(ips))]
 		key := ip.String()
 		return append(preserved, rrByIP[key]...)
