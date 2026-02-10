@@ -64,6 +64,10 @@ func checkKindName(k checkKind) string {
 	}
 }
 
+func shouldLogProbeErr(err error) bool {
+	return err == nil || !errors.Is(err, context.Canceled)
+}
+
 func (p *prober) pickBest(ctx context.Context, host string, pref ipPreference, ips []net.IP, checks []checkSpec) (net.IP, bool) {
 	if len(ips) == 0 {
 		return nil, false
@@ -230,11 +234,15 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 					start := time.Now()
 					err := tcpConnect(ctx2, ip, c.port)
 					d := time.Since(start)
-					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, err)
+					if shouldLogProbeErr(err) {
+						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, err)
+					}
 					resultCh <- probeResult{kind: c.kind, port: c.port, d: d, ok: err == nil, err: err}
 				case checkHTTP:
 					d, err := p.httpProbe(ctx2, ip, c.port, host)
-					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, err)
+					if shouldLogProbeErr(err) {
+						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, err)
+					}
 					resultCh <- probeResult{kind: c.kind, port: c.port, d: d, ok: err == nil, err: err}
 				default:
 					err := errors.New("unknown check kind")
@@ -272,6 +280,11 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 						return pingDur, true
 					}
 					return time.Since(start), true
+				} else if errors.Is(err, context.Canceled) {
+					if pingOK {
+						return pingDur, true
+					}
+					return 0, false
 				} else {
 					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, false, time.Since(start), err)
 				}
@@ -283,6 +296,11 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 						return pingDur, true
 					}
 					return d, true
+				} else if errors.Is(err, context.Canceled) {
+					if pingOK {
+						return pingDur, true
+					}
+					return 0, false
 				} else {
 					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, false, d, err)
 				}
