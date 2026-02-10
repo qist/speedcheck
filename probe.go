@@ -69,9 +69,9 @@ func (p *prober) pickBest(ctx context.Context, host string, pref ipPreference, i
 		return nil, false
 	}
 
-	baseCtx := ctx
-	if baseCtx == nil || baseCtx.Err() != nil {
-		baseCtx = context.Background()
+	baseCtx := context.Background()
+	if ctx != nil {
+		baseCtx = context.WithoutCancel(ctx)
 	}
 	ctx, cancel := context.WithCancel(baseCtx)
 	defer cancel()
@@ -182,9 +182,9 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 		return 0, true
 	}
 
-	baseCtx := ctx
-	if baseCtx == nil || baseCtx.Err() != nil {
-		baseCtx = context.Background()
+	baseCtx := context.Background()
+	if ctx != nil {
+		baseCtx = context.WithoutCancel(ctx)
 	}
 	ctx, cancel := context.WithTimeout(baseCtx, p.timeout)
 	defer cancel()

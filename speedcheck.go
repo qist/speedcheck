@@ -196,9 +196,9 @@ func (s *SpeedCheck) selectFastest(ctx context.Context, host string, qtype uint1
 		}
 	}
 
-	baseCtx := ctx
-	if baseCtx == nil || baseCtx.Err() != nil {
-		baseCtx = context.Background()
+	baseCtx := context.Background()
+	if ctx != nil {
+		baseCtx = context.WithoutCancel(ctx)
 	}
 	ctx, cancel := context.WithTimeout(baseCtx, s.cfg.timeout)
 	defer cancel()
@@ -251,9 +251,9 @@ func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aa
 	reqA.Question[0].Qtype = dns.TypeA
 
 	cw := newCaptureWriter(w)
-	baseCtx := ctx
-	if baseCtx == nil || baseCtx.Err() != nil {
-		baseCtx = context.Background()
+	baseCtx := context.Background()
+	if ctx != nil {
+		baseCtx = context.WithoutCancel(ctx)
 	}
 	rcode, _ := plugin.NextOrFailure(s.Name(), s.Next, baseCtx, cw, reqA)
 	if cw.Msg == nil || rcode != dns.RcodeSuccess || cw.Msg.Rcode != dns.RcodeSuccess {
