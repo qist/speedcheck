@@ -21,7 +21,7 @@ speedcheck {
     speed-cache-ttl 30s
     speed-ip-mode ipv4,ipv6
     speed-ip-parallel off
-    speed-host-override rrs04.hw.gmcc.net,tcp:8088,ipv4
+    speed-host-override www.google.com,tcp:443,ipv4
     check_http_send "HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
     check_http_expect_alive http_2xx http_3xx http_4xx
 }
