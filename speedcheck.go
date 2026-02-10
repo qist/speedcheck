@@ -196,7 +196,11 @@ func (s *SpeedCheck) selectFastest(ctx context.Context, host string, qtype uint1
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, s.cfg.timeout)
+	baseCtx := ctx
+	if baseCtx == nil || baseCtx.Err() != nil {
+		baseCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, s.cfg.timeout)
 	defer cancel()
 
 	pref := s.cfg.ipPref
@@ -247,7 +251,11 @@ func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aa
 	reqA.Question[0].Qtype = dns.TypeA
 
 	cw := newCaptureWriter(w)
-	rcode, _ := plugin.NextOrFailure(s.Name(), s.Next, ctx, cw, reqA)
+	baseCtx := ctx
+	if baseCtx == nil || baseCtx.Err() != nil {
+		baseCtx = context.Background()
+	}
+	rcode, _ := plugin.NextOrFailure(s.Name(), s.Next, baseCtx, cw, reqA)
 	if cw.Msg == nil || rcode != dns.RcodeSuccess || cw.Msg.Rcode != dns.RcodeSuccess {
 		speedcheckDebugf("aaaa-race upstream A failed host=%s rcode=%d msg=%v", host, rcode, cw.Msg != nil)
 		return nil, false
@@ -265,7 +273,7 @@ func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aa
 		return nil, false
 	}
 
-	ctx2, cancel := context.WithTimeout(ctx, s.cfg.timeout)
+	ctx2, cancel := context.WithTimeout(baseCtx, s.cfg.timeout)
 	defer cancel()
 
 	speedcheckDebugf("aaaa-race probing host=%s ips=%d", host, len(ips))
