@@ -220,6 +220,9 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 		}
 	}
 
+	if pingOK {
+		return pingDur, true
+	}
 	return 0, false
 }
 
