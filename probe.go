@@ -269,7 +269,7 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 
 	speedcheckDebugf("probe ip=%s host=%s ping=%t others=%d parallel=%t timeout=%s", ip.String(), host, pingSeen, len(others), p.parallelChecks, p.timeout)
 
-	if pingSeen {
+	if pingSeen && !p.parallelChecks {
 		start := time.Now()
 		ctxPing, cancelPing := context.WithTimeout(probeCtx, p.timeout)
 		if err := pingOnce(ctxPing, ip); err == nil {
@@ -293,7 +293,21 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 		ctx2, cancel2 := context.WithCancel(probeCtx)
 		defer cancel2()
 
-		resultCh := make(chan probeResult, len(others))
+		resultCh := make(chan probeResult, len(others)+1)
+		if pingSeen {
+			go func() {
+				start := time.Now()
+				ctxPing, cancelPing := context.WithTimeout(ctx2, p.timeout)
+				left := ctxLeft(ctxPing)
+				err := pingOnce(ctxPing, ip)
+				cancelPing()
+				d := time.Since(start)
+				if shouldLogProbeErr(err) {
+					speedcheckDebugf("check host=%s ip=%s kind=%s ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(checkPing), err == nil, d, left, err, errDetails(err))
+				}
+				resultCh <- probeResult{kind: checkPing, d: d, ok: err == nil, err: err}
+			}()
+		}
 		for _, c := range others {
 			c := c
 			go func() {
@@ -323,7 +337,11 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 			}()
 		}
 
-		for remaining := len(others); remaining > 0; remaining-- {
+		remainingTotal := len(others)
+		if pingSeen {
+			remainingTotal++
+		}
+		for remaining := remainingTotal; remaining > 0; remaining-- {
 			select {
 			case <-probeCtx.Done():
 				if pingOK {
@@ -331,6 +349,13 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 				}
 				return 0, false
 			case r := <-resultCh:
+				if r.kind == checkPing {
+					if r.ok {
+						cancel2()
+						return r.d, true
+					}
+					continue
+				}
 				if r.ok {
 					cancel2()
 					if pingOK {
