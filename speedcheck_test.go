@@ -107,8 +107,31 @@ speedcheck {
 	}
 }
 
+func TestParseSpeedCheckParallel(t *testing.T) {
+	c := caddy.NewTestController("dns", `
+speedcheck {
+  speed-check-mode tcp:80
+  speed-check-parallel on
+}
+`)
+	sc, err := parse(c)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if !sc.cfg.parallelChecks {
+		t.Fatalf("expected parallelChecks enabled")
+	}
+	p, ok := sc.prober.(*prober)
+	if !ok {
+		t.Fatalf("expected prober type")
+	}
+	if !p.parallelChecks {
+		t.Fatalf("expected prober parallelChecks enabled")
+	}
+}
+
 func TestHTTPStatusAlive(t *testing.T) {
-	p := newDefaultProber(1*time.Second, nil, map[httpAliveClass]struct{}{httpAlive5xx: {}})
+	p := newDefaultProber(1*time.Second, false, nil, map[httpAliveClass]struct{}{httpAlive5xx: {}})
 	if !p.httpStatusAlive(503) {
 		t.Fatalf("expected 503 to be alive when http_5xx is configured")
 	}
@@ -116,7 +139,7 @@ func TestHTTPStatusAlive(t *testing.T) {
 		t.Fatalf("expected 204 to be not alive when only http_5xx is configured")
 	}
 
-	pAll := newDefaultProber(1*time.Second, nil, nil)
+	pAll := newDefaultProber(1*time.Second, false, nil, nil)
 	if !pAll.httpStatusAlive(204) || !pAll.httpStatusAlive(503) {
 		t.Fatalf("expected http_all behavior when classes are not configured")
 	}
@@ -382,7 +405,7 @@ func TestProbeIPShortCircuitStopsAfterFirstSuccess(t *testing.T) {
 		close(accept1Done)
 	}()
 
-	p := newDefaultProber(500*time.Millisecond, nil, nil)
+	p := newDefaultProber(500*time.Millisecond, false, nil, nil)
 	ip := net.ParseIP("127.0.0.1").To4()
 	_, ok := p.probeIP(context.Background(), ip, "example.org", []checkSpec{
 		{kind: checkTCP, port: port1},
@@ -431,7 +454,7 @@ func TestProbeIPShortCircuitTriesNextAfterFailure(t *testing.T) {
 		acceptDone <- err
 	}()
 
-	p := newDefaultProber(500*time.Millisecond, nil, nil)
+	p := newDefaultProber(500*time.Millisecond, false, nil, nil)
 	ip := net.ParseIP("127.0.0.1").To4()
 	_, ok := p.probeIP(context.Background(), ip, "example.org", []checkSpec{
 		{kind: checkTCP, port: failPort},
@@ -443,4 +466,70 @@ func TestProbeIPShortCircuitTriesNextAfterFailure(t *testing.T) {
 	if err := <-acceptDone; err != nil {
 		t.Fatalf("expected to probe second port, got accept err %v", err)
 	}
+}
+
+func TestProbeIPParallelChecksCanSucceedBeforeTimeout(t *testing.T) {
+	slowL, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen slow: %v", err)
+	}
+	defer slowL.Close()
+	slowPort := uint16(slowL.Addr().(*net.TCPAddr).Port)
+
+	fastL, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen fast: %v", err)
+	}
+	defer fastL.Close()
+	fastPort := uint16(fastL.Addr().(*net.TCPAddr).Port)
+
+	slowDone := make(chan struct{})
+	go func() {
+		defer close(slowDone)
+		_ = slowL.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Second))
+		c, err := slowL.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_ = c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		_, _ = c.Read(make([]byte, 1024))
+		time.Sleep(500 * time.Millisecond)
+		_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+	}()
+
+	fastDone := make(chan struct{})
+	go func() {
+		defer close(fastDone)
+		_ = fastL.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Second))
+		c, err := fastL.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_ = c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		_, _ = c.Read(make([]byte, 1024))
+		_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+	}()
+
+	ip := net.ParseIP("127.0.0.1").To4()
+	checks := []checkSpec{
+		{kind: checkHTTP, port: slowPort},
+		{kind: checkHTTP, port: fastPort},
+	}
+
+	pSeq := newDefaultProber(200*time.Millisecond, false, nil, nil)
+	_, ok := pSeq.probeIP(context.Background(), ip, "example.org", checks)
+	if ok {
+		t.Fatalf("expected sequential checks to fail due to timeout")
+	}
+
+	pPar := newDefaultProber(200*time.Millisecond, true, nil, nil)
+	_, ok = pPar.probeIP(context.Background(), ip, "example.org", checks)
+	if !ok {
+		t.Fatalf("expected parallel checks to succeed")
+	}
+
+	<-slowDone
+	<-fastDone
 }

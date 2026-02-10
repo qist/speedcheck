@@ -46,6 +46,7 @@ type config struct {
 	ipPref           ipPreference
 	timeout          time.Duration
 	cacheTTL         time.Duration
+	parallelChecks   bool
 	httpSend         []byte
 	httpAliveClasses map[httpAliveClass]struct{}
 }
@@ -99,6 +100,14 @@ func parse(c *caddy.Controller) (*SpeedCheck, error) {
 				if err := parseSpeedCacheTTL(&cfg, args); err != nil {
 					return nil, err
 				}
+			case "speed-check-parallel":
+				args := c.RemainingArgs()
+				if len(args) == 0 {
+					return nil, c.ArgErr()
+				}
+				if err := parseSpeedCheckParallel(&cfg, args); err != nil {
+					return nil, err
+				}
 			case "check_http_send":
 				args := c.RemainingArgs()
 				if len(args) != 1 {
@@ -121,7 +130,7 @@ func parse(c *caddy.Controller) (*SpeedCheck, error) {
 
 	return &SpeedCheck{
 		cfg:    cfg,
-		prober: newDefaultProber(cfg.timeout, cfg.httpSend, cfg.httpAliveClasses),
+		prober: newDefaultProber(cfg.timeout, cfg.parallelChecks, cfg.httpSend, cfg.httpAliveClasses),
 		cache:  newIPCache(cfg.cacheTTL),
 	}, nil
 }
@@ -206,6 +215,25 @@ func parseSpeedCacheTTL(cfg *config, args []string) error {
 	}
 	cfg.cacheTTL = d
 	return nil
+}
+
+func parseSpeedCheckParallel(cfg *config, args []string) error {
+	if len(args) == 2 && strings.EqualFold(args[0], "parallel") {
+		args = args[1:]
+	}
+	if len(args) != 1 {
+		return fmt.Errorf("invalid speed-check-parallel %q", strings.Join(args, " "))
+	}
+	switch strings.ToLower(strings.TrimSpace(args[0])) {
+	case "on", "true", "1", "yes":
+		cfg.parallelChecks = true
+		return nil
+	case "off", "false", "0", "no":
+		cfg.parallelChecks = false
+		return nil
+	default:
+		return fmt.Errorf("invalid speed-check-parallel %q", args[0])
+	}
 }
 
 func parseSpeedIPMode(cfg *config, args []string) error {

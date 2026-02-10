@@ -21,6 +21,7 @@ import (
 
 type prober struct {
 	timeout          time.Duration
+	parallelChecks   bool
 	httpSend         []byte
 	httpAliveClasses map[httpAliveClass]struct{}
 }
@@ -29,13 +30,14 @@ type ipPicker interface {
 	pickBest(ctx context.Context, host string, pref ipPreference, ips []net.IP, checks []checkSpec) (net.IP, bool)
 }
 
-func newDefaultProber(timeout time.Duration, httpSend []byte, httpAliveClasses map[httpAliveClass]struct{}) *prober {
+func newDefaultProber(timeout time.Duration, parallelChecks bool, httpSend []byte, httpAliveClasses map[httpAliveClass]struct{}) *prober {
 	cp := make(map[httpAliveClass]struct{}, len(httpAliveClasses))
 	for k := range httpAliveClasses {
 		cp[k] = struct{}{}
 	}
 	return &prober{
 		timeout:          timeout,
+		parallelChecks:   parallelChecks,
 		httpSend:         httpSend,
 		httpAliveClasses: cp,
 	}
@@ -197,26 +199,67 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 		return 0, false
 	}
 
-	for _, c := range others {
-		switch c.kind {
-		case checkTCP:
-			start := time.Now()
-			if err := tcpConnect(ctx, ip, c.port); err == nil {
+	if p.parallelChecks {
+		ctx2, cancel2 := context.WithCancel(ctx)
+		defer cancel2()
+
+		resultCh := make(chan probeResult, len(others))
+		for _, c := range others {
+			c := c
+			go func() {
+				switch c.kind {
+				case checkTCP:
+					start := time.Now()
+					err := tcpConnect(ctx2, ip, c.port)
+					resultCh <- probeResult{kind: c.kind, d: time.Since(start), ok: err == nil, err: err}
+				case checkHTTP:
+					d, err := p.httpProbe(ctx2, ip, c.port, host)
+					resultCh <- probeResult{kind: c.kind, d: d, ok: err == nil, err: err}
+				default:
+					resultCh <- probeResult{kind: c.kind, ok: false, err: errors.New("unknown check kind")}
+				}
+			}()
+		}
+
+		for remaining := len(others); remaining > 0; remaining-- {
+			select {
+			case <-ctx.Done():
 				if pingOK {
 					return pingDur, true
 				}
-				return time.Since(start), true
-			}
-		case checkHTTP:
-			d, err := p.httpProbe(ctx, ip, c.port, host)
-			if err == nil {
-				if pingOK {
-					return pingDur, true
+				return 0, false
+			case r := <-resultCh:
+				if r.ok {
+					cancel2()
+					if pingOK {
+						return pingDur, true
+					}
+					return r.d, true
 				}
-				return d, true
 			}
-		default:
-			return 0, false
+		}
+	} else {
+		for _, c := range others {
+			switch c.kind {
+			case checkTCP:
+				start := time.Now()
+				if err := tcpConnect(ctx, ip, c.port); err == nil {
+					if pingOK {
+						return pingDur, true
+					}
+					return time.Since(start), true
+				}
+			case checkHTTP:
+				d, err := p.httpProbe(ctx, ip, c.port, host)
+				if err == nil {
+					if pingOK {
+						return pingDur, true
+					}
+					return d, true
+				}
+			default:
+				return 0, false
+			}
 		}
 	}
 

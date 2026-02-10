@@ -17,6 +17,7 @@ speedcheck 会对上游返回的多个 A/AAAA 记录做连通性/速度探测，
 speedcheck {
     speed-check-mode ping,tcp:80,tcp:443
     speed-timeout-mode 3s
+    speed-check-parallel off
     speed-cache-ttl 30s
     speed-ip-mode ipv4,ipv6
     check_http_send "HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
@@ -29,6 +30,7 @@ speedcheck {
   - 如果仅配置 `ping`（没有任何 `tcp/http`）：就只做 ping 探测
   - 如果不包含 `ping`：直接按配置顺序尝试 `tcp/http`，其中任意一个成功即短路
 - `speed-timeout-mode`：探测超时时间，默认 `2s`
+- `speed-check-parallel`：是否并发执行同一 IP 的 `tcp/http` 探测（`on` / `off`），默认 `off`；开启后会在任意一个 `tcp/http` 成功时短路返回
 - `speed-cache-ttl`：缓存探测结果的时间（按域名与查询类型缓存），默认 `0`（关闭）
 - `speed-ip-mode`：IP 家族优先级（`ipv4,ipv6` / `ipv6,ipv4` / `ipv4` / `ipv6` / 不配置默认 `ipv6,ipv4`）
 - 回落：当所有 IP 的探测都失败时，如果同时存在 IPv4/IPv6，则优先回落返回 IPv4
