@@ -744,6 +744,16 @@ func TestHTTPRedirectLocationIPFamilyMismatch(t *testing.T) {
 	<-done
 }
 
+func TestProbeIPPingOnlyParallelChecksStillRunsPing(t *testing.T) {
+	p := newDefaultProber(200*time.Millisecond, true, nil, nil)
+	p.pingFn = func(ctx context.Context, ip net.IP) error { return nil }
+	ip := net.ParseIP("127.0.0.1").To4()
+	_, ok := p.probeIP(context.Background(), ip, "example.org", []checkSpec{{kind: checkPing}})
+	if !ok {
+		t.Fatalf("expected ok")
+	}
+}
+
 func TestHostOverrideForceIPv4ReturnsEmptyAAAAWithoutProbing(t *testing.T) {
 	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 		m := new(dns.Msg)

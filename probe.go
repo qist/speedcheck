@@ -26,6 +26,7 @@ type prober struct {
 	parallelChecks   bool
 	httpSend         []byte
 	httpAliveClasses map[httpAliveClass]struct{}
+	pingFn           func(ctx context.Context, ip net.IP) error
 }
 
 type ipPicker interface {
@@ -42,6 +43,7 @@ func newDefaultProber(timeout time.Duration, parallelChecks bool, httpSend []byt
 		parallelChecks:   parallelChecks,
 		httpSend:         httpSend,
 		httpAliveClasses: cp,
+		pingFn:           pingOnce,
 	}
 }
 
@@ -270,10 +272,10 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 
 	speedcheckDebugf("probe ip=%s host=%s ping=%t others=%d parallel=%t timeout=%s", ip.String(), host, pingSeen, len(others), p.parallelChecks, p.timeout)
 
-	if pingSeen && !p.parallelChecks {
+	if pingSeen && (!p.parallelChecks || len(others) == 0) {
 		start := time.Now()
 		ctxPing, cancelPing := context.WithTimeout(probeCtx, p.timeout)
-		if err := pingOnce(ctxPing, ip); err == nil {
+		if err := p.pingFn(ctxPing, ip); err == nil {
 			pingOK = true
 			pingDur = time.Since(start)
 		}
@@ -300,7 +302,7 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 				start := time.Now()
 				ctxPing, cancelPing := context.WithTimeout(ctx2, p.timeout)
 				left := ctxLeft(ctxPing)
-				err := pingOnce(ctxPing, ip)
+				err := p.pingFn(ctxPing, ip)
 				cancelPing()
 				d := time.Since(start)
 				if shouldLogProbeErr(err) {
