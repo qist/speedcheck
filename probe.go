@@ -73,7 +73,9 @@ func (p *prober) pickBest(ctx context.Context, host string, pref ipPreference, i
 		return nil, false
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
+	probeCtx, cancel := context.WithCancel(context.Background())
+	timer := time.AfterFunc(p.timeout, cancel)
+	defer timer.Stop()
 	defer cancel()
 
 	type outcome struct {
@@ -95,7 +97,7 @@ func (p *prober) pickBest(ctx context.Context, host string, pref ipPreference, i
 	for _, ip := range ips {
 		ip := ip
 		go func() {
-			_, ok := p.probeIP(ctx, ip, host, checks)
+			_, ok := p.probeIP(probeCtx, ip, host, checks)
 			resultCh <- outcome{ip: ip, ok: ok}
 		}()
 	}
@@ -105,7 +107,7 @@ func (p *prober) pickBest(ctx context.Context, host string, pref ipPreference, i
 		var v4Candidate net.IP
 		for remaining := len(ips); remaining > 0; remaining-- {
 			select {
-			case <-ctx.Done():
+			case <-probeCtx.Done():
 				return nil, false
 			case r := <-resultCh:
 				if r.ip.To4() == nil {
@@ -135,7 +137,7 @@ func (p *prober) pickBest(ctx context.Context, host string, pref ipPreference, i
 		var v6Candidate net.IP
 		for remaining := len(ips); remaining > 0; remaining-- {
 			select {
-			case <-ctx.Done():
+			case <-probeCtx.Done():
 				return nil, false
 			case r := <-resultCh:
 				if r.ip.To4() != nil {
@@ -164,7 +166,7 @@ func (p *prober) pickBest(ctx context.Context, host string, pref ipPreference, i
 	default:
 		for remaining := len(ips); remaining > 0; remaining-- {
 			select {
-			case <-ctx.Done():
+			case <-probeCtx.Done():
 				return nil, false
 			case r := <-resultCh:
 				if r.ok {
@@ -182,11 +184,18 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 		return 0, true
 	}
 
-	baseCtx := ctx
-	if baseCtx == nil {
-		baseCtx = context.Background()
+	probeCtx, cancel := context.WithCancel(context.Background())
+	if ctx != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				cancel()
+			case <-probeCtx.Done():
+			}
+		}()
 	}
-	ctx, cancel := context.WithTimeout(baseCtx, p.timeout)
+	timer := time.AfterFunc(p.timeout, cancel)
+	defer timer.Stop()
 	defer cancel()
 
 	var (
@@ -205,10 +214,12 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 
 	if pingSeen {
 		start := time.Now()
-		if err := pingOnce(ctx, ip); err == nil {
+		ctxPing, cancelPing := context.WithTimeout(probeCtx, p.timeout)
+		if err := pingOnce(ctxPing, ip); err == nil {
 			pingOK = true
 			pingDur = time.Since(start)
 		}
+		cancelPing()
 	}
 
 	if len(others) == 0 {
@@ -222,24 +233,26 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 	}
 
 	if p.parallelChecks {
-		ctx2, cancel2 := context.WithCancel(ctx)
+		ctx2, cancel2 := context.WithCancel(probeCtx)
 		defer cancel2()
 
 		resultCh := make(chan probeResult, len(others))
 		for _, c := range others {
 			c := c
 			go func() {
+				ctxCheck, cancelCheck := context.WithTimeout(ctx2, p.timeout)
+				defer cancelCheck()
 				switch c.kind {
 				case checkTCP:
 					start := time.Now()
-					err := tcpConnect(ctx2, ip, c.port)
+					err := tcpConnect(ctxCheck, ip, c.port)
 					d := time.Since(start)
 					if shouldLogProbeErr(err) {
 						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, err)
 					}
 					resultCh <- probeResult{kind: c.kind, port: c.port, d: d, ok: err == nil, err: err}
 				case checkHTTP:
-					d, err := p.httpProbe(ctx2, ip, c.port, host)
+					d, err := p.httpProbe(ctxCheck, ip, c.port, host)
 					if shouldLogProbeErr(err) {
 						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, err)
 					}
@@ -254,7 +267,7 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 
 		for remaining := len(others); remaining > 0; remaining-- {
 			select {
-			case <-ctx.Done():
+			case <-probeCtx.Done():
 				if pingOK {
 					return pingDur, true
 				}
@@ -271,16 +284,19 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 		}
 	} else {
 		for _, c := range others {
+			ctxCheck, cancelCheck := context.WithTimeout(probeCtx, p.timeout)
 			switch c.kind {
 			case checkTCP:
 				start := time.Now()
-				if err := tcpConnect(ctx, ip, c.port); err == nil {
+				if err := tcpConnect(ctxCheck, ip, c.port); err == nil {
 					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, true, time.Since(start), nil)
+					cancelCheck()
 					if pingOK {
 						return pingDur, true
 					}
 					return time.Since(start), true
 				} else if errors.Is(err, context.Canceled) {
+					cancelCheck()
 					if pingOK {
 						return pingDur, true
 					}
@@ -289,14 +305,16 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, false, time.Since(start), err)
 				}
 			case checkHTTP:
-				d, err := p.httpProbe(ctx, ip, c.port, host)
+				d, err := p.httpProbe(ctxCheck, ip, c.port, host)
 				if err == nil {
 					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, true, d, nil)
+					cancelCheck()
 					if pingOK {
 						return pingDur, true
 					}
 					return d, true
 				} else if errors.Is(err, context.Canceled) {
+					cancelCheck()
 					if pingOK {
 						return pingDur, true
 					}
@@ -305,8 +323,10 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, false, d, err)
 				}
 			default:
+				cancelCheck()
 				return 0, false
 			}
+			cancelCheck()
 		}
 	}
 
@@ -429,12 +449,9 @@ func httpSendBytes(httpSend []byte, host string) []byte {
 }
 
 func (p *prober) httpProbe(ctx context.Context, ip net.IP, port uint16, host string) (time.Duration, error) {
-	baseCtx := ctx
-	if baseCtx == nil {
-		baseCtx = context.Background()
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(baseCtx, p.timeout)
-	defer cancel()
 	if port == 443 {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
