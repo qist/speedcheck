@@ -112,6 +112,29 @@ speedcheck {
 	}
 }
 
+func TestParseHostOverridePipeDelimiterAndIPOrder(t *testing.T) {
+	c := caddy.NewTestController("dns", `
+speedcheck {
+  speed-check-mode ping
+  speed-host-override www.google.com|tcp:443,http:443|ipv4,ipv6
+}
+`)
+	sc, err := parse(c)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	ov, ok := sc.cfg.hostOverrides["www.google.com"]
+	if !ok {
+		t.Fatalf("expected host override")
+	}
+	if !ov.enabled || ov.ipPref != ipPrefV4First || !ov.allowOther {
+		t.Fatalf("unexpected host override: %#v", ov)
+	}
+	if len(ov.checks) != 2 || ov.checks[0].port != 443 || ov.checks[1].port != 443 {
+		t.Fatalf("unexpected checks: %#v", ov.checks)
+	}
+}
+
 func TestParseSpeedTimeoutMode(t *testing.T) {
 	c := caddy.NewTestController("dns", `
 speedcheck {

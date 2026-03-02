@@ -54,9 +54,10 @@ type config struct {
 }
 
 type hostOverride struct {
-	enabled bool
-	checks  []checkSpec
-	ipPref  ipPreference
+	enabled    bool
+	checks     []checkSpec
+	ipPref     ipPreference
+	allowOther bool
 }
 
 func parse(c *caddy.Controller) (*SpeedCheck, error) {
@@ -410,7 +411,19 @@ func parseSpeedHostOverride(cfg *config, args []string) error {
 	}
 
 	var entries []entry
-	if len(args) >= 1 && strings.Count(args[0], ",") >= 2 {
+	if len(args) >= 1 && strings.Count(args[0], "|") >= 2 {
+		for _, a := range args {
+			if strings.Count(a, "|") < 2 {
+				return fmt.Errorf("invalid speed-host-override %q", strings.Join(args, " "))
+			}
+			parts := strings.SplitN(a, "|", 3)
+			entries = append(entries, entry{
+				host:      strings.TrimSpace(parts[0]),
+				checkMode: strings.TrimSpace(parts[1]),
+				ipMode:    strings.TrimSpace(parts[2]),
+			})
+		}
+	} else if len(args) >= 1 && strings.Count(args[0], ",") >= 2 {
 		for _, a := range args {
 			if strings.Count(a, ",") < 2 {
 				return fmt.Errorf("invalid speed-host-override %q", strings.Join(args, " "))
@@ -443,20 +456,53 @@ func parseSpeedHostOverride(cfg *config, args []string) error {
 			return fmt.Errorf("invalid speed-host-override check-mode for host %q: %w", host, err)
 		}
 
-		var pref ipPreference
-		switch strings.ToLower(strings.TrimSpace(e.ipMode)) {
-		case "ipv4", "v4":
-			pref = ipPrefV4First
-		case "ipv6", "v6":
-			pref = ipPrefV6First
-		default:
+		tokens := strings.Split(e.ipMode, ",")
+		var (
+			seenV4      bool
+			seenV6      bool
+			firstFamily string
+		)
+		for _, raw := range tokens {
+			t := strings.ToLower(strings.TrimSpace(raw))
+			switch t {
+			case "":
+				continue
+			case "ipv4", "v4":
+				seenV4 = true
+				if firstFamily == "" {
+					firstFamily = t
+				}
+			case "ipv6", "v6":
+				seenV6 = true
+				if firstFamily == "" {
+					firstFamily = t
+				}
+			default:
+				return fmt.Errorf("invalid speed-host-override ip-mode %q for host %q", e.ipMode, host)
+			}
+		}
+
+		if !seenV4 && !seenV6 {
 			return fmt.Errorf("invalid speed-host-override ip-mode %q for host %q", e.ipMode, host)
 		}
 
+		var pref ipPreference
+		if seenV4 && !seenV6 {
+			pref = ipPrefV4First
+		} else if seenV6 && !seenV4 {
+			pref = ipPrefV6First
+		} else if firstFamily == "ipv4" || firstFamily == "v4" {
+			pref = ipPrefV4First
+		} else {
+			pref = ipPrefV6First
+		}
+		allowOther := seenV4 && seenV6
+
 		cfg.hostOverrides[host] = hostOverride{
-			enabled: enabled,
-			checks:  checks,
-			ipPref:  pref,
+			enabled:    enabled,
+			checks:     checks,
+			ipPref:     pref,
+			allowOther: allowOther,
 		}
 	}
 	return nil

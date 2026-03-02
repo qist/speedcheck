@@ -125,35 +125,102 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 
 	host := strings.TrimSuffix(q.Name, ".")
 	override, hasOverride := s.cfg.hostOverrides[strings.ToLower(host)]
+
+	checks := s.cfg.checks
+	pref := s.cfg.ipPref
+	parallelIPs := s.cfg.parallelIPs
+	allowOther := false
 	if hasOverride {
-		if q.Qtype == dns.TypeAAAA && override.ipPref == ipPrefV4First {
-			speedcheckDebugf("host override force ipv4, return empty AAAA host=%s", host)
-			msg.Answer = s.dropAAAA(msg.Answer)
-			state := request.Request{W: w, Req: r}
-			state.SizeAndDo(msg)
-			_ = w.WriteMsg(msg)
-			return msg.Rcode, err
+		if override.enabled {
+			checks = override.checks
+		} else {
+			checks = nil
 		}
-		if q.Qtype == dns.TypeA && override.ipPref == ipPrefV6First {
-			speedcheckDebugf("host override force ipv6, return empty A host=%s", host)
-			out := make([]dns.RR, 0, len(msg.Answer))
-			for _, rr := range msg.Answer {
-				if _, ok := rr.(*dns.A); ok {
-					continue
+		pref = override.ipPref
+		parallelIPs = false
+		allowOther = override.allowOther
+	}
+
+	if hasOverride && (q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA) {
+		if q.Qtype == dns.TypeAAAA {
+			if pref == ipPrefV4First {
+				if allowOther {
+					if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeA, s.fetchUpstreamAnswer(w, r, dns.TypeA), checks, ipPrefV4First, false); ok {
+						speedcheckDebugf("host override prefer ipv4 (v4 ok), return empty AAAA host=%s", host)
+						msg.Answer = s.dropAAAA(msg.Answer)
+						state := request.Request{W: w, Req: r}
+						state.SizeAndDo(msg)
+						_ = w.WriteMsg(msg)
+						return msg.Rcode, err
+					}
+				} else {
+					speedcheckDebugf("host override force ipv4, return empty AAAA host=%s", host)
+					msg.Answer = s.dropAAAA(msg.Answer)
+					state := request.Request{W: w, Req: r}
+					state.SizeAndDo(msg)
+					_ = w.WriteMsg(msg)
+					return msg.Rcode, err
 				}
-				out = append(out, rr)
+			} else {
+				if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeAAAA, msg.Answer, checks, ipPrefV6First, false); ok {
+					selected := s.selectFastestWith(ctx, host, dns.TypeAAAA, msg.Answer, checks, ipPrefV6First, false)
+					if selected != nil {
+						msg.Answer = selected
+					}
+					state := request.Request{W: w, Req: r}
+					state.SizeAndDo(msg)
+					_ = w.WriteMsg(msg)
+					return msg.Rcode, err
+				}
+				if allowOther {
+					if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeA, s.fetchUpstreamAnswer(w, r, dns.TypeA), checks, ipPrefV4First, false); ok {
+						speedcheckDebugf("host override prefer ipv6 but v6 failed, use ipv4 fallback host=%s", host)
+						msg.Answer = s.dropAAAA(msg.Answer)
+						state := request.Request{W: w, Req: r}
+						state.SizeAndDo(msg)
+						_ = w.WriteMsg(msg)
+						return msg.Rcode, err
+					}
+				}
 			}
-			msg.Answer = out
-			state := request.Request{W: w, Req: r}
-			state.SizeAndDo(msg)
-			_ = w.WriteMsg(msg)
-			return msg.Rcode, err
+		} else if q.Qtype == dns.TypeA {
+			if pref == ipPrefV6First {
+				if allowOther {
+					if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeAAAA, s.fetchUpstreamAnswer(w, r, dns.TypeAAAA), checks, ipPrefV6First, false); ok {
+						speedcheckDebugf("host override prefer ipv6 (v6 ok), return empty A host=%s", host)
+						msg.Answer = s.dropA(msg.Answer)
+						state := request.Request{W: w, Req: r}
+						state.SizeAndDo(msg)
+						_ = w.WriteMsg(msg)
+						return msg.Rcode, err
+					}
+				} else {
+					speedcheckDebugf("host override force ipv6, return empty A host=%s", host)
+					msg.Answer = s.dropA(msg.Answer)
+					state := request.Request{W: w, Req: r}
+					state.SizeAndDo(msg)
+					_ = w.WriteMsg(msg)
+					return msg.Rcode, err
+				}
+			} else {
+				if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeA, msg.Answer, checks, ipPrefV4First, false); !ok && allowOther {
+					if _, ok2 := s.selectFastestStrictWith(ctx, host, dns.TypeAAAA, s.fetchUpstreamAnswer(w, r, dns.TypeAAAA), checks, ipPrefV6First, false); ok2 {
+						speedcheckDebugf("host override prefer ipv4 but v4 failed, use ipv6 fallback host=%s", host)
+						msg.Answer = s.dropA(msg.Answer)
+						state := request.Request{W: w, Req: r}
+						state.SizeAndDo(msg)
+						_ = w.WriteMsg(msg)
+						return msg.Rcode, err
+					}
+				}
+			}
 		}
 	}
 	if q.Qtype == dns.TypeAAAA && s.cfg.parallelIPs {
 		if hasOverride {
 			speedcheckDebugf("host override disables aaaa-race host=%s", host)
 		} else if ip, ok := s.pickBestAcrossFamilies(ctx, host, msg.Answer, r, w); ok {
+			speedcheckDebugf("aaaa-race winner name=%s ip=%s", q.Name, ip.String())
 			speedcheckDebugf("aaaa-race winner name=%s ip=%s", q.Name, ip.String())
 			if ip.To4() != nil {
 				speedcheckDebugf("aaaa-race return empty AAAA name=%s", q.Name)
@@ -171,19 +238,6 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 		}
 	}
 
-	checks := s.cfg.checks
-	pref := s.cfg.ipPref
-	parallelIPs := s.cfg.parallelIPs
-	if hasOverride {
-		if override.enabled {
-			checks = override.checks
-		} else {
-			checks = nil
-		}
-		pref = override.ipPref
-		parallelIPs = false
-	}
-
 	selected := s.selectFastestWith(ctx, host, q.Qtype, msg.Answer, checks, pref, parallelIPs)
 	if selected != nil {
 		msg.Answer = selected
@@ -197,6 +251,75 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 
 func (s *SpeedCheck) selectFastest(ctx context.Context, host string, qtype uint16, answer []dns.RR) []dns.RR {
 	return s.selectFastestWith(ctx, host, qtype, answer, s.cfg.checks, s.cfg.ipPref, s.cfg.parallelIPs)
+}
+
+func (s *SpeedCheck) fetchUpstreamAnswer(w dns.ResponseWriter, r *dns.Msg, qtype uint16) []dns.RR {
+	if r == nil || len(r.Question) == 0 {
+		return nil
+	}
+	req := r.Copy()
+	req.Question[0].Qtype = qtype
+
+	cw := newCaptureWriter(w)
+	ctx2, cancel := context.WithTimeout(context.Background(), s.cfg.timeout)
+	defer cancel()
+	rcode, _ := plugin.NextOrFailure(s.Name(), s.Next, ctx2, cw, req)
+	if cw.Msg == nil || rcode != dns.RcodeSuccess || cw.Msg.Rcode != dns.RcodeSuccess {
+		return nil
+	}
+	return cw.Msg.Answer
+}
+
+func (s *SpeedCheck) selectFastestStrictWith(ctx context.Context, host string, qtype uint16, answer []dns.RR, checks []checkSpec, pref ipPreference, parallelIPs bool) ([]dns.RR, bool) {
+	var ips []net.IP
+	var rrByIP = make(map[string][]dns.RR)
+	var preserved []dns.RR
+
+	for _, rr := range answer {
+		switch a := rr.(type) {
+		case *dns.A:
+			if qtype != dns.TypeA && qtype != dns.TypeANY {
+				preserved = append(preserved, rr)
+				continue
+			}
+			ip := a.A
+			key := ip.String()
+			ips = append(ips, ip)
+			rrByIP[key] = append(rrByIP[key], rr)
+		case *dns.AAAA:
+			if qtype != dns.TypeAAAA && qtype != dns.TypeANY {
+				preserved = append(preserved, rr)
+				continue
+			}
+			ip := a.AAAA
+			key := ip.String()
+			ips = append(ips, ip)
+			rrByIP[key] = append(rrByIP[key], rr)
+		default:
+			preserved = append(preserved, rr)
+		}
+	}
+
+	if len(ips) == 0 {
+		return nil, false
+	}
+
+	ctx2, cancel := context.WithTimeout(context.Background(), s.cfg.timeout)
+	defer cancel()
+
+	if parallelIPs {
+		pref = ipPrefNone
+	}
+	bestIP, ok := s.prober.pickBest(ctx2, host, pref, ips, checks)
+	if !ok {
+		speedcheckDebugf("pickBest failed host=%s qtype=%d ips=%d", host, qtype, len(ips))
+		return nil, false
+	}
+
+	key := bestIP.String()
+	s.cache.Set(host, qtype, key, time.Now())
+	speedcheckDebugf("pickBest ok host=%s qtype=%d ip=%s", host, qtype, key)
+	return append(preserved, rrByIP[key]...), true
 }
 
 func (s *SpeedCheck) selectFastestWith(ctx context.Context, host string, qtype uint16, answer []dns.RR, checks []checkSpec, pref ipPreference, parallelIPs bool) []dns.RR {
@@ -332,6 +455,17 @@ func (s *SpeedCheck) dropAAAA(answer []dns.RR) []dns.RR {
 	out := make([]dns.RR, 0, len(answer))
 	for _, rr := range answer {
 		if _, ok := rr.(*dns.AAAA); ok {
+			continue
+		}
+		out = append(out, rr)
+	}
+	return out
+}
+
+func (s *SpeedCheck) dropA(answer []dns.RR) []dns.RR {
+	out := make([]dns.RR, 0, len(answer))
+	for _, rr := range answer {
+		if _, ok := rr.(*dns.A); ok {
 			continue
 		}
 		out = append(out, rr)
