@@ -141,6 +141,33 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 		allowOther = override.allowOther
 	}
 
+	if hasOverride && !override.enabled {
+		switch q.Qtype {
+		case dns.TypeAAAA:
+			if pref == ipPrefV4First {
+				speedcheckDebugf("host override none, prefer ipv4, return empty AAAA host=%s", host)
+				msg.Answer = s.dropAAAA(msg.Answer)
+			}
+		case dns.TypeA:
+			if pref == ipPrefV6First {
+				speedcheckDebugf("host override none, prefer ipv6, return empty A host=%s", host)
+				msg.Answer = s.dropA(msg.Answer)
+			}
+		case dns.TypeANY:
+			if pref == ipPrefV4First {
+				speedcheckDebugf("host override none, prefer ipv4, drop AAAA host=%s", host)
+				msg.Answer = s.dropAAAA(msg.Answer)
+			} else if pref == ipPrefV6First {
+				speedcheckDebugf("host override none, prefer ipv6, drop A host=%s", host)
+				msg.Answer = s.dropA(msg.Answer)
+			}
+		}
+		state := request.Request{W: w, Req: r}
+		state.SizeAndDo(msg)
+		_ = w.WriteMsg(msg)
+		return msg.Rcode, err
+	}
+
 	if hasOverride && (q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA) {
 		if q.Qtype == dns.TypeAAAA {
 			if pref == ipPrefV4First {

@@ -429,11 +429,23 @@ func tcpConnect(ctx context.Context, ip net.IP, port uint16) error {
 	if err != nil {
 		return err
 	}
+	setLinger0(conn)
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
 	}
 	_ = conn.Close()
 	return nil
+}
+
+func setLinger0(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	tc, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tc.SetLinger(0)
 }
 
 func pingOnce(ctx context.Context, ip net.IP) error {
@@ -631,6 +643,7 @@ func (p *prober) http1Probe(ctx context.Context, ip net.IP, port uint16, host st
 	if err != nil {
 		return 0, err
 	}
+	setLinger0(rawConn)
 	defer rawConn.Close()
 
 	conn := rawConn

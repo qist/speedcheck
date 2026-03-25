@@ -49,6 +49,7 @@ speedcheck {
     - 仅单一 IP 家族：`ipv4` / `ipv6`（也支持 `v4` / `v6`）
     - 允许 v4+v6 并按顺序偏好：`ipv4,ipv6` 或 `ipv6,ipv4`（第一个为偏好，第二个为兜底）
   - 命中后会使用该域名专属的 check-mode 与 ip 家族选择，并禁用 `speed-ip-parallel` 的 v4/v6 竞速与 AAAA-race
+  - `<check-mode>` 配置为 `none` 时：该域名不做任何探测，也不会把多 IP 收敛为单 IP，仅按 `<ip-mode>` 做 A/AAAA 的保留/清空（用于强制客户端走指定家族）
   - 仅 `ipv4` 时：对 AAAA 查询直接返回空 AAAA（促使客户端回落使用 A）；仅 `ipv6` 时：对 A 查询返回空 A
   - `ipv4,ipv6` 或 `ipv6,ipv4` 时：会先按偏好家族探测；偏好家族探测成功则返回空（促使客户端用另一查询类型拿到偏好家族结果）；偏好失败但兜底成功则允许回落到兜底家族
 - `check_http_send`：自定义 HTTP/1.x 探测报文；其中 `{host}` / `{HOST}` 会替换为当前 DNS 查询域名；默认 `GET / HTTP/1.0\r\n\r\n`
