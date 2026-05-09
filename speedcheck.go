@@ -36,6 +36,8 @@ func speedcheckDebugf(format string, args ...interface{}) {
 	_, _ = fmt.Fprintf(os.Stderr, "speedcheck-debug: "+format+"\n", args...)
 }
 
+const maxCacheEntries = 4096
+
 type ipCache struct {
 	ttl time.Duration
 	mu  sync.RWMutex
@@ -88,6 +90,17 @@ func (c *ipCache) Set(host string, qtype uint16, ip string, now time.Time) {
 	}
 	k := cacheKey(host, qtype)
 	c.mu.Lock()
+	if len(c.m) >= maxCacheEntries {
+		for k, e := range c.m {
+			if now.After(e.expiresAt) {
+				delete(c.m, k)
+			}
+		}
+		if len(c.m) >= maxCacheEntries {
+			c.mu.Unlock()
+			return
+		}
+	}
 	c.m[k] = cacheEntry{ip: ip, expiresAt: now.Add(c.ttl)}
 	c.mu.Unlock()
 }
@@ -124,7 +137,7 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 	}
 
 	host := strings.TrimSuffix(q.Name, ".")
-	override, hasOverride := s.cfg.hostOverrides[strings.ToLower(host)]
+	override, hasOverride := s.findOverride(strings.ToLower(host))
 
 	checks := s.cfg.checks
 	pref := s.cfg.ipPref
@@ -498,4 +511,21 @@ func (s *SpeedCheck) dropA(answer []dns.RR) []dns.RR {
 		out = append(out, rr)
 	}
 	return out
+}
+
+func (s *SpeedCheck) findOverride(host string) (hostOverride, bool) {
+	if ov, ok := s.cfg.hostOverrides[host]; ok {
+		return ov, true
+	}
+	for {
+		dot := strings.IndexByte(host, '.')
+		if dot < 0 {
+			break
+		}
+		host = host[dot+1:]
+		if ov, ok := s.cfg.hostOverrides["*."+host]; ok {
+			return ov, true
+		}
+	}
+	return hostOverride{}, false
 }

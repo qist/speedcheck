@@ -941,3 +941,165 @@ func TestHostOverrideUsesCustomChecksAndForcesNoParallelIPs(t *testing.T) {
 		t.Fatalf("expected override checks tcp:8088, got %#v", cc.checks)
 	}
 }
+
+func TestHostOverrideWildcardMatchesSubdomain(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::1")},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	cp := &captureChecksProber{ip: net.ParseIP("1.1.1.1").To4(), ok: true}
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled: true,
+			checks:  []checkSpec{{kind: checkTCP, port: 80}},
+			hostOverrides: map[string]hostOverride{
+				"*.example.com": {
+					enabled: true,
+					checks:  []checkSpec{{kind: checkTCP, port: 443}},
+					ipPref:  ipPrefV4First,
+				},
+			},
+		},
+		prober: cp,
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("foo.example.com.", dns.TypeAAAA)
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(w.msg.Answer) != 0 {
+		t.Fatalf("expected empty AAAA (wildcard override forces v4), got %d answers", len(w.msg.Answer))
+	}
+}
+
+func TestHostOverrideWildcardMatchesDeepSubdomain(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::1")},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled: true,
+			hostOverrides: map[string]hostOverride{
+				"*.example.com": {
+					enabled: false,
+					ipPref:  ipPrefV4First,
+				},
+			},
+		},
+		prober: fakeProber{ip: nil, ok: false},
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("a.b.c.example.com.", dns.TypeAAAA)
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(w.msg.Answer) != 0 {
+		t.Fatalf("expected empty AAAA for deep subdomain match, got %d answers", len(w.msg.Answer))
+	}
+}
+
+func TestHostOverrideWildcardDoesNotMatchBareDomain(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::1")},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled: true,
+			hostOverrides: map[string]hostOverride{
+				"*.example.com": {
+					enabled: false,
+					ipPref:  ipPrefV4First,
+				},
+			},
+		},
+		prober: fakeProber{ip: nil, ok: false},
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeAAAA)
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	// wildcard should NOT match bare domain, AAAA should be preserved
+	if len(w.msg.Answer) != 1 {
+		t.Fatalf("expected 1 AAAA answer (wildcard should not match bare domain), got %d", len(w.msg.Answer))
+	}
+}
+
+func TestHostOverrideExactMatchTakesPrecedenceOverWildcard(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("2.2.2.2").To4()},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	cp := &captureChecksProber{ip: net.ParseIP("1.1.1.1").To4(), ok: true}
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled: true,
+			checks:  []checkSpec{{kind: checkTCP, port: 80}},
+			hostOverrides: map[string]hostOverride{
+				"*.example.com": {
+					enabled: true,
+					checks:  []checkSpec{{kind: checkTCP, port: 443}},
+					ipPref:  ipPrefV4First,
+				},
+				"foo.example.com": {
+					enabled: true,
+					checks:  []checkSpec{{kind: checkTCP, port: 8080}},
+					ipPref:  ipPrefV4First,
+				},
+			},
+		},
+		prober: cp,
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("foo.example.com.", dns.TypeA)
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	// exact match should win: checks should be tcp:8080, not tcp:443
+	if len(cp.checks) != 1 || cp.checks[0].port != 8080 {
+		t.Fatalf("expected exact match override (tcp:8080), got %#v", cp.checks)
+	}
+}

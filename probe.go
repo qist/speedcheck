@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go/http3"
@@ -21,9 +22,21 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
+var defaultDialer net.Dialer
+
+var icmpBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 1500)
+		return &buf
+	},
+}
+
+var baseTLSConfig = &tls.Config{InsecureSkipVerify: true}
+
 type prober struct {
 	timeout          time.Duration
 	parallelChecks   bool
+	maxConcurrency   int
 	httpSend         []byte
 	httpAliveClasses map[httpAliveClass]struct{}
 	pingFn           func(ctx context.Context, ip net.IP) error
@@ -41,6 +54,7 @@ func newDefaultProber(timeout time.Duration, parallelChecks bool, httpSend []byt
 	return &prober{
 		timeout:          timeout,
 		parallelChecks:   parallelChecks,
+		maxConcurrency:   8,
 		httpSend:         httpSend,
 		httpAliveClasses: cp,
 		pingFn:           pingOnce,
@@ -152,9 +166,19 @@ func (p *prober) pickBest(ctx context.Context, host string, pref ipPreference, i
 		}
 	}
 
+	var sem chan struct{}
+	if p.maxConcurrency > 0 && len(ips) > p.maxConcurrency {
+		sem = make(chan struct{}, p.maxConcurrency)
+	}
 	for _, ip := range ips {
 		ip := ip
+		if sem != nil {
+			sem <- struct{}{}
+		}
 		go func() {
+			if sem != nil {
+				defer func() { <-sem }()
+			}
 			_, ok := p.probeIP(probeCtx, ip, host, checks)
 			resultCh <- outcome{ip: ip, ok: ok}
 		}()
@@ -242,16 +266,11 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 		return 0, true
 	}
 
-	probeCtx, cancel := context.WithCancel(context.Background())
-	if ctx != nil {
-		go func() {
-			select {
-			case <-ctx.Done():
-				cancel()
-			case <-probeCtx.Done():
-			}
-		}()
+	parentCtx := ctx
+	if parentCtx == nil {
+		parentCtx = context.Background()
 	}
+	probeCtx, cancel := context.WithCancel(parentCtx)
 	timer := time.AfterFunc(p.timeout, cancel)
 	defer timer.Stop()
 	defer cancel()
@@ -424,8 +443,7 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 }
 
 func tcpConnect(ctx context.Context, ip net.IP, port uint16) error {
-	d := &net.Dialer{}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(int(port))))
+	conn, err := defaultDialer.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(int(port))))
 	if err != nil {
 		return err
 	}
@@ -487,7 +505,9 @@ func pingICMP(ctx context.Context, network string, ip net.IP, echoType, replyTyp
 		return err
 	}
 
-	buf := make([]byte, 1500)
+	bufPtr := icmpBufPool.Get().(*[]byte)
+	defer icmpBufPool.Put(bufPtr)
+	buf := *bufPtr
 	if dl, ok := ctx.Deadline(); ok {
 		_ = c.SetReadDeadline(dl)
 	}
@@ -638,8 +658,7 @@ func (p *prober) http1Probe(ctx context.Context, ip net.IP, port uint16, host st
 	start := time.Now()
 	host = sanitizeHost(host)
 	addr := net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))
-	d := &net.Dialer{}
-	rawConn, err := d.DialContext(ctx, "tcp", addr)
+	rawConn, err := defaultDialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return 0, err
 	}
@@ -648,11 +667,10 @@ func (p *prober) http1Probe(ctx context.Context, ip net.IP, port uint16, host st
 
 	conn := rawConn
 	if tlsEnabled {
-		tlsConn := tls.Client(rawConn, &tls.Config{
-			InsecureSkipVerify: true,
-			ServerName:         host,
-			NextProtos:         []string{"h2", "http/1.1"},
-		})
+		tlsCfg := baseTLSConfig.Clone()
+		tlsCfg.ServerName = host
+		tlsCfg.NextProtos = []string{"h2", "http/1.1"}
+		tlsConn := tls.Client(rawConn, tlsCfg)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			return 0, err
 		}
@@ -701,11 +719,10 @@ func (p *prober) http3Probe(ctx context.Context, ip net.IP, port uint16, host st
 	}
 	url := "https://" + authority + "/"
 
+	tlsCfg := baseTLSConfig.Clone()
+	tlsCfg.ServerName = host
 	tr := &http3.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-			ServerName:         host,
-		},
+		TLSClientConfig: tlsCfg,
 	}
 	defer tr.Close()
 
