@@ -36,8 +36,6 @@ func speedcheckDebugf(format string, args ...interface{}) {
 	_, _ = fmt.Fprintf(os.Stderr, "speedcheck-debug: "+format+"\n", args...)
 }
 
-const maxCacheEntries = 4096
-
 type ipCache struct {
 	ttl time.Duration
 	mu  sync.RWMutex
@@ -90,17 +88,6 @@ func (c *ipCache) Set(host string, qtype uint16, ip string, now time.Time) {
 	}
 	k := cacheKey(host, qtype)
 	c.mu.Lock()
-	if len(c.m) >= maxCacheEntries {
-		for k, e := range c.m {
-			if now.After(e.expiresAt) {
-				delete(c.m, k)
-			}
-		}
-		if len(c.m) >= maxCacheEntries {
-			c.mu.Unlock()
-			return
-		}
-	}
 	c.m[k] = cacheEntry{ip: ip, expiresAt: now.Add(c.ttl)}
 	c.mu.Unlock()
 }
@@ -185,7 +172,7 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 		if q.Qtype == dns.TypeAAAA {
 			if pref == ipPrefV4First {
 				if allowOther {
-					if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeA, s.fetchUpstreamAnswer(w, r, dns.TypeA), checks, ipPrefV4First, false); ok {
+					if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeA, s.fetchUpstreamAnswer(ctx, w, r, dns.TypeA), checks, ipPrefV4First, false); ok {
 						speedcheckDebugf("host override prefer ipv4 (v4 ok), return empty AAAA host=%s", host)
 						msg.Answer = s.dropAAAA(msg.Answer)
 						state := request.Request{W: w, Req: r}
@@ -213,7 +200,7 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 					return msg.Rcode, err
 				}
 				if allowOther {
-					if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeA, s.fetchUpstreamAnswer(w, r, dns.TypeA), checks, ipPrefV4First, false); ok {
+					if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeA, s.fetchUpstreamAnswer(ctx, w, r, dns.TypeA), checks, ipPrefV4First, false); ok {
 						speedcheckDebugf("host override prefer ipv6 but v6 failed, use ipv4 fallback host=%s", host)
 						msg.Answer = s.dropAAAA(msg.Answer)
 						state := request.Request{W: w, Req: r}
@@ -226,7 +213,7 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 		} else if q.Qtype == dns.TypeA {
 			if pref == ipPrefV6First {
 				if allowOther {
-					if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeAAAA, s.fetchUpstreamAnswer(w, r, dns.TypeAAAA), checks, ipPrefV6First, false); ok {
+					if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeAAAA, s.fetchUpstreamAnswer(ctx, w, r, dns.TypeAAAA), checks, ipPrefV6First, false); ok {
 						speedcheckDebugf("host override prefer ipv6 (v6 ok), return empty A host=%s", host)
 						msg.Answer = s.dropA(msg.Answer)
 						state := request.Request{W: w, Req: r}
@@ -244,7 +231,7 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 				}
 			} else {
 				if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeA, msg.Answer, checks, ipPrefV4First, false); !ok && allowOther {
-					if _, ok2 := s.selectFastestStrictWith(ctx, host, dns.TypeAAAA, s.fetchUpstreamAnswer(w, r, dns.TypeAAAA), checks, ipPrefV6First, false); ok2 {
+					if _, ok2 := s.selectFastestStrictWith(ctx, host, dns.TypeAAAA, s.fetchUpstreamAnswer(ctx, w, r, dns.TypeAAAA), checks, ipPrefV6First, false); ok2 {
 						speedcheckDebugf("host override prefer ipv4 but v4 failed, use ipv6 fallback host=%s", host)
 						msg.Answer = s.dropA(msg.Answer)
 						state := request.Request{W: w, Req: r}
@@ -293,7 +280,7 @@ func (s *SpeedCheck) selectFastest(ctx context.Context, host string, qtype uint1
 	return s.selectFastestWith(ctx, host, qtype, answer, s.cfg.checks, s.cfg.ipPref, s.cfg.parallelIPs)
 }
 
-func (s *SpeedCheck) fetchUpstreamAnswer(w dns.ResponseWriter, r *dns.Msg, qtype uint16) []dns.RR {
+func (s *SpeedCheck) fetchUpstreamAnswer(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, qtype uint16) []dns.RR {
 	if r == nil || len(r.Question) == 0 {
 		return nil
 	}
@@ -301,7 +288,7 @@ func (s *SpeedCheck) fetchUpstreamAnswer(w dns.ResponseWriter, r *dns.Msg, qtype
 	req.Question[0].Qtype = qtype
 
 	cw := newCaptureWriter(w)
-	ctx2, cancel := context.WithTimeout(context.Background(), s.cfg.timeout)
+	ctx2, cancel := context.WithTimeout(ctx, s.cfg.timeout)
 	defer cancel()
 	rcode, _ := plugin.NextOrFailure(s.Name(), s.Next, ctx2, cw, req)
 	if cw.Msg == nil || rcode != dns.RcodeSuccess || cw.Msg.Rcode != dns.RcodeSuccess {
@@ -344,7 +331,7 @@ func (s *SpeedCheck) selectFastestStrictWith(ctx context.Context, host string, q
 		return nil, false
 	}
 
-	ctx2, cancel := context.WithTimeout(context.Background(), s.cfg.timeout)
+	ctx2, cancel := context.WithTimeout(ctx, s.cfg.timeout)
 	defer cancel()
 
 	if parallelIPs {
@@ -404,7 +391,7 @@ func (s *SpeedCheck) selectFastestWith(ctx context.Context, host string, qtype u
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.timeout)
+	ctx, cancel := context.WithTimeout(ctx, s.cfg.timeout)
 	defer cancel()
 
 	if parallelIPs {
@@ -454,7 +441,7 @@ func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aa
 	reqA.Question[0].Qtype = dns.TypeA
 
 	cw := newCaptureWriter(w)
-	ctxA, cancelA := context.WithTimeout(context.Background(), s.cfg.timeout)
+	ctxA, cancelA := context.WithTimeout(ctx, s.cfg.timeout)
 	defer cancelA()
 	rcode, _ := plugin.NextOrFailure(s.Name(), s.Next, ctxA, cw, reqA)
 	if cw.Msg == nil || rcode != dns.RcodeSuccess || cw.Msg.Rcode != dns.RcodeSuccess {
@@ -474,7 +461,7 @@ func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aa
 		return nil, false
 	}
 
-	ctx2, cancel := context.WithTimeout(context.Background(), s.cfg.timeout)
+	ctx2, cancel := context.WithTimeout(ctx, s.cfg.timeout)
 	defer cancel()
 
 	speedcheckDebugf("aaaa-race probing host=%s ips=%d", host, len(ips))

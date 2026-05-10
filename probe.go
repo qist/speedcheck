@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go/http3"
@@ -22,7 +23,9 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
-var defaultDialer net.Dialer
+var defaultDialer = net.Dialer{
+	Control: tcpFastOpenControl,
+}
 
 var icmpBufPool = sync.Pool{
 	New: func() any {
@@ -32,6 +35,64 @@ var icmpBufPool = sync.Pool{
 }
 
 var baseTLSConfig = &tls.Config{InsecureSkipVerify: true}
+
+// --- HTTP/3 transport pool (per host) ---
+
+var h3TransportPool sync.Map // key: host(string) -> *h3TransportEntry
+
+type h3TransportEntry struct {
+	tr      *http3.Transport
+	tlsCfg  *tls.Config
+	created time.Time
+}
+
+func getH3Transport(host string) *http3.Transport {
+	if v, ok := h3TransportPool.Load(host); ok {
+		return v.(*h3TransportEntry).tr
+	}
+	tlsCfg := baseTLSConfig.Clone()
+	tlsCfg.ServerName = host
+	tr := &http3.Transport{
+		TLSClientConfig: tlsCfg,
+	}
+	entry := &h3TransportEntry{tr: tr, tlsCfg: tlsCfg, created: time.Now()}
+	actual, _ := h3TransportPool.LoadOrStore(host, entry)
+	return actual.(*h3TransportEntry).tr
+}
+
+// --- ICMP socket pool (v4 / v6) ---
+
+var (
+	icmpV4Pool = sync.Pool{New: func() any { c, _ := icmp.ListenPacket("ip4:icmp", ""); return c }}
+	icmpV6Pool = sync.Pool{New: func() any { c, _ := icmp.ListenPacket("ip6:ipv6-icmp", ""); return c }}
+	icmpIDSeq  atomic.Uint32
+)
+
+func getICMPConn(v4 bool) *icmp.PacketConn {
+	if v4 {
+		if c, ok := icmpV4Pool.Get().(*icmp.PacketConn); ok && c != nil {
+			return c
+		}
+		c, _ := icmp.ListenPacket("ip4:icmp", "")
+		return c
+	}
+	if c, ok := icmpV6Pool.Get().(*icmp.PacketConn); ok && c != nil {
+		return c
+	}
+	c, _ := icmp.ListenPacket("ip6:ipv6-icmp", "")
+	return c
+}
+
+func putICMPConn(v4 bool, c *icmp.PacketConn) {
+	if c == nil {
+		return
+	}
+	if v4 {
+		icmpV4Pool.Put(c)
+	} else {
+		icmpV6Pool.Put(c)
+	}
+}
 
 type prober struct {
 	timeout          time.Duration
@@ -54,7 +115,7 @@ func newDefaultProber(timeout time.Duration, parallelChecks bool, httpSend []byt
 	return &prober{
 		timeout:          timeout,
 		parallelChecks:   parallelChecks,
-		maxConcurrency:   8,
+		maxConcurrency:   32,
 		httpSend:         httpSend,
 		httpAliveClasses: cp,
 		pingFn:           pingOnce,
@@ -145,7 +206,7 @@ func (p *prober) pickBest(ctx context.Context, host string, pref ipPreference, i
 		return nil, false
 	}
 
-	probeCtx, cancel := context.WithCancel(context.Background())
+	probeCtx, cancel := context.WithCancel(ctx)
 	timer := time.AfterFunc(p.timeout, cancel)
 	defer timer.Stop()
 	defer cancel()
@@ -478,14 +539,16 @@ func pingOnce(ctx context.Context, ip net.IP) error {
 }
 
 func pingICMP(ctx context.Context, network string, ip net.IP, echoType, replyType icmp.Type) error {
-	c, err := icmp.ListenPacket(network, "")
-	if err != nil {
-		return err
+	isV4 := strings.HasPrefix(network, "ip4:")
+	c := getICMPConn(isV4)
+	if c == nil {
+		return errors.New("icmp listen failed")
 	}
-	defer c.Close()
+	defer putICMPConn(isV4, c)
 
-	id := int(time.Now().UnixNano() & 0xffff)
-	seq := 1
+	idSeq := icmpIDSeq.Add(1)
+	id := int(idSeq & 0xffff)
+	seq := int((idSeq >> 16) & 0xffff)
 	msg := icmp.Message{
 		Type: echoType,
 		Code: 0,
@@ -719,12 +782,7 @@ func (p *prober) http3Probe(ctx context.Context, ip net.IP, port uint16, host st
 	}
 	url := "https://" + authority + "/"
 
-	tlsCfg := baseTLSConfig.Clone()
-	tlsCfg.ServerName = host
-	tr := &http3.Transport{
-		TLSClientConfig: tlsCfg,
-	}
-	defer tr.Close()
+	tr := getH3Transport(host)
 
 	client := &http.Client{
 		Transport: tr,
