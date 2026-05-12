@@ -397,7 +397,7 @@ func TestFallbackWhenAllFailedPrefersV4(t *testing.T) {
 	}
 }
 
-func TestAAAAQueryParallelIPCanReturnEmptyAAAA(t *testing.T) {
+func TestAAAAQueryParallelIPReturnsFastestIPv6(t *testing.T) {
 	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 		m := new(dns.Msg)
 		m.SetReply(r)
@@ -422,7 +422,7 @@ func TestAAAAQueryParallelIPCanReturnEmptyAAAA(t *testing.T) {
 			timeout:     1 * time.Second,
 			parallelIPs: true,
 		},
-		prober: fakeProber{ip: net.ParseIP("1.1.1.1").To4(), ok: true},
+		prober: fakeProber{ip: net.ParseIP("2001:db8::1"), ok: true},
 	}
 
 	req := new(dns.Msg)
@@ -436,12 +436,15 @@ func TestAAAAQueryParallelIPCanReturnEmptyAAAA(t *testing.T) {
 	if w.msg == nil {
 		t.Fatalf("expected response")
 	}
-	if len(w.msg.Answer) != 0 {
-		t.Fatalf("expected empty AAAA answer, got %d", len(w.msg.Answer))
+	if len(w.msg.Answer) != 1 {
+		t.Fatalf("expected 1 AAAA answer, got %d", len(w.msg.Answer))
+	}
+	if _, ok := w.msg.Answer[0].(*dns.AAAA); !ok {
+		t.Fatalf("expected AAAA record, got %T", w.msg.Answer[0])
 	}
 }
 
-func TestAAAAQueryParallelIPProbeFailStillReturnsEmptyAAAA(t *testing.T) {
+func TestAAAAQueryParallelIPProbeFailFallbackToAAAA(t *testing.T) {
 	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 		m := new(dns.Msg)
 		m.SetReply(r)
@@ -480,8 +483,11 @@ func TestAAAAQueryParallelIPProbeFailStillReturnsEmptyAAAA(t *testing.T) {
 	if w.msg == nil {
 		t.Fatalf("expected response")
 	}
-	if len(w.msg.Answer) != 0 {
-		t.Fatalf("expected empty AAAA answer, got %d", len(w.msg.Answer))
+	if len(w.msg.Answer) != 1 {
+		t.Fatalf("expected 1 AAAA answer (fallback), got %d", len(w.msg.Answer))
+	}
+	if _, ok := w.msg.Answer[0].(*dns.AAAA); !ok {
+		t.Fatalf("expected AAAA record, got %T", w.msg.Answer[0])
 	}
 }
 
