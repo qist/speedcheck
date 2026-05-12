@@ -38,7 +38,12 @@ var baseTLSConfig = &tls.Config{InsecureSkipVerify: true}
 
 // --- HTTP/3 transport pool (per host) ---
 
-var h3TransportPool sync.Map // key: host(string) -> *h3TransportEntry
+const h3TransportTTL = 5 * time.Minute
+
+var (
+	h3TransportPool sync.Map // key: host(string) -> *h3TransportEntry
+	h3CleanupOnce   sync.Once
+)
 
 type h3TransportEntry struct {
 	tr      *http3.Transport
@@ -47,9 +52,17 @@ type h3TransportEntry struct {
 }
 
 func getH3Transport(host string) *http3.Transport {
+	h3CleanupOnce.Do(startH3Cleanup)
+
 	if v, ok := h3TransportPool.Load(host); ok {
-		return v.(*h3TransportEntry).tr
+		entry := v.(*h3TransportEntry)
+		if time.Since(entry.created) < h3TransportTTL {
+			return entry.tr
+		}
+		h3TransportPool.Delete(host)
+		go entry.tr.Close()
 	}
+
 	tlsCfg := baseTLSConfig.Clone()
 	tlsCfg.ServerName = host
 	tr := &http3.Transport{
@@ -57,7 +70,29 @@ func getH3Transport(host string) *http3.Transport {
 	}
 	entry := &h3TransportEntry{tr: tr, tlsCfg: tlsCfg, created: time.Now()}
 	actual, _ := h3TransportPool.LoadOrStore(host, entry)
-	return actual.(*h3TransportEntry).tr
+	actualEntry := actual.(*h3TransportEntry)
+	if actualEntry != entry {
+		tr.Close()
+	}
+	return actualEntry.tr
+}
+
+func startH3Cleanup() {
+	go func() {
+		ticker := time.NewTicker(h3TransportTTL)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			h3TransportPool.Range(func(key, value any) bool {
+				entry := value.(*h3TransportEntry)
+				if now.Sub(entry.created) >= h3TransportTTL {
+					h3TransportPool.Delete(key)
+					entry.tr.Close()
+				}
+				return true
+			})
+		}
+	}()
 }
 
 // --- ICMP socket pool (v4 / v6) ---
