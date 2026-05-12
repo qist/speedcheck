@@ -237,18 +237,10 @@ cd coredns
 
 ~~~ txt
 # 使用 sed 自动添加到 cache:cache 前面
-sed -i '/^cache:cache$/i\speedcheck:github.com/qist/speedcheck' plugin.cfg
+sed -i '/^cache:cache$/i\speedcheck:speedcheck' plugin.cfg
 ~~~
 
-3) 拉取 speedcheck 模块源码（两种方式任选其一）：
-
-- 方式 A：Go 自动拉取（推荐）
-
-~~~ txt
-go get github.com/qist/speedcheck@latest
-~~~
-
-- 方式 B：手动 clone（用于固定版本或离线环境）
+3) 拉取 speedcheck 模块源码：
 
 ~~~ txt
 cd coredns
