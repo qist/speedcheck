@@ -250,7 +250,7 @@ git clone https://github.com/qist/speedcheck.git plugin/speedcheck
 4) 重新生成插件注册代码并编译：
 
 ~~~ txt
-go generate coredns.go
+go generate
 make
 ~~~
 
