@@ -583,6 +583,21 @@ func TestCacheExpiryTriggersReprobe(t *testing.T) {
 	}
 }
 
+func TestCacheSetCleansExpiredEntries(t *testing.T) {
+	cache := newIPCache(10 * time.Millisecond)
+	defer cache.Close()
+
+	cache.Set("old.example", dns.TypeA, "1.1.1.1", time.Now())
+	time.Sleep(25 * time.Millisecond)
+
+	cache.mu.RLock()
+	defer cache.mu.RUnlock()
+
+	if _, ok := cache.m[cacheKey("old.example", dns.TypeA)]; ok {
+		t.Fatal("expected expired cache entry to be cleaned")
+	}
+}
+
 func TestProbeIPShortCircuitStopsAfterFirstSuccess(t *testing.T) {
 	l1, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

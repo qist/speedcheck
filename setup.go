@@ -21,5 +21,10 @@ func setup(c *caddy.Controller) error {
 		return cfg
 	})
 
+	c.OnShutdown(func() error {
+		cfg.OnShutdown()
+		return nil
+	})
+
 	return nil
 }

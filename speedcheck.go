@@ -27,6 +27,12 @@ type SpeedCheck struct {
 
 func (s *SpeedCheck) Name() string { return pluginName }
 
+func (s *SpeedCheck) OnShutdown() {
+	if s.cache != nil {
+		s.cache.Close()
+	}
+}
+
 var speedcheckDebug = os.Getenv("SPEEDCHECK_DEBUG") != ""
 
 func speedcheckDebugf(format string, args ...interface{}) {
@@ -37,9 +43,11 @@ func speedcheckDebugf(format string, args ...interface{}) {
 }
 
 type ipCache struct {
-	ttl time.Duration
-	mu  sync.RWMutex
-	m   map[string]cacheEntry
+	ttl      time.Duration
+	mu       sync.RWMutex
+	m        map[string]cacheEntry
+	stopOnce sync.Once
+	stopCh   chan struct{}
 }
 
 type cacheEntry struct {
@@ -51,7 +59,13 @@ func newIPCache(ttl time.Duration) *ipCache {
 	if ttl <= 0 {
 		return nil
 	}
-	return &ipCache{ttl: ttl, m: make(map[string]cacheEntry)}
+	c := &ipCache{
+		ttl:    ttl,
+		m:      make(map[string]cacheEntry),
+		stopCh: make(chan struct{}),
+	}
+	go c.cleanupLoop()
+	return c
 }
 
 func cacheKey(host string, qtype uint16) string {
@@ -90,6 +104,53 @@ func (c *ipCache) Set(host string, qtype uint16, ip string, now time.Time) {
 	c.mu.Lock()
 	c.m[k] = cacheEntry{ip: ip, expiresAt: now.Add(c.ttl)}
 	c.mu.Unlock()
+}
+
+func (c *ipCache) Clear() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.m = make(map[string]cacheEntry)
+	c.mu.Unlock()
+}
+
+func (c *ipCache) Close() {
+	if c == nil {
+		return
+	}
+	c.stopOnce.Do(func() {
+		close(c.stopCh)
+	})
+	c.Clear()
+}
+
+func (c *ipCache) cleanupLoop() {
+	ticker := time.NewTicker(c.ttl)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case now := <-ticker.C:
+			c.cleanupExpired(now)
+		case <-c.stopCh:
+			return
+		}
+	}
+}
+
+func (c *ipCache) cleanupExpired(now time.Time) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for k, ent := range c.m {
+		if now.After(ent.expiresAt) {
+			delete(c.m, k)
+		}
+	}
 }
 
 func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
