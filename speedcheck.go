@@ -392,23 +392,23 @@ func (s *SpeedCheck) selectFastestWith(ctx context.Context, host string, qtype u
 	for _, rr := range answer {
 		switch a := rr.(type) {
 		case *dns.A:
-			if qtype != dns.TypeA && qtype != dns.TypeANY {
+			if parallelIPs || qtype == dns.TypeA || qtype == dns.TypeANY {
+				ip := a.A
+				key := ip.String()
+				ips = append(ips, ip)
+				rrByIP[key] = append(rrByIP[key], rr)
+			} else {
 				preserved = append(preserved, rr)
-				continue
 			}
-			ip := a.A
-			key := ip.String()
-			ips = append(ips, ip)
-			rrByIP[key] = append(rrByIP[key], rr)
 		case *dns.AAAA:
-			if qtype != dns.TypeAAAA && qtype != dns.TypeANY {
+			if parallelIPs || qtype == dns.TypeAAAA || qtype == dns.TypeANY {
+				ip := a.AAAA
+				key := ip.String()
+				ips = append(ips, ip)
+				rrByIP[key] = append(rrByIP[key], rr)
+			} else {
 				preserved = append(preserved, rr)
-				continue
 			}
-			ip := a.AAAA
-			key := ip.String()
-			ips = append(ips, ip)
-			rrByIP[key] = append(rrByIP[key], rr)
 		default:
 			preserved = append(preserved, rr)
 		}
@@ -449,9 +449,21 @@ func (s *SpeedCheck) selectFastestWith(ctx context.Context, host string, qtype u
 	}
 
 	key := bestIP.String()
+	bestRRs := rrByIP[key]
+	if len(bestRRs) == 0 {
+		// Cross-family win: AAAA query but IPv4 won (or vice versa)
+		// Cache under the actual record type so next same-family query hits
+		cacheType := dns.TypeA
+		if bestIP.To4() == nil {
+			cacheType = dns.TypeAAAA
+		}
+		s.cache.Set(host, cacheType, key, time.Now())
+		speedcheckDebugf("cross-family win host=%s qtype=%d bestIP=%s cacheType=%d", host, qtype, key, cacheType)
+		return nil
+	}
 	s.cache.Set(host, qtype, key, time.Now())
 	speedcheckDebugf("pickBest ok host=%s qtype=%d ip=%s", host, qtype, key)
-	return append(preserved, rrByIP[key]...)
+	return append(preserved, bestRRs...)
 }
 
 func (s *SpeedCheck) dropAAAA(answer []dns.RR) []dns.RR {

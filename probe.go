@@ -14,13 +14,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go/http3"
-	"golang.org/x/net/icmp"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 )
 
 var defaultDialer = net.Dialer{
@@ -93,40 +89,6 @@ func startH3Cleanup() {
 			})
 		}
 	}()
-}
-
-// --- ICMP socket pool (v4 / v6) ---
-
-var (
-	icmpV4Pool = sync.Pool{New: func() any { c, _ := icmp.ListenPacket("ip4:icmp", ""); return c }}
-	icmpV6Pool = sync.Pool{New: func() any { c, _ := icmp.ListenPacket("ip6:ipv6-icmp", ""); return c }}
-	icmpIDSeq  atomic.Uint32
-)
-
-func getICMPConn(v4 bool) *icmp.PacketConn {
-	if v4 {
-		if c, ok := icmpV4Pool.Get().(*icmp.PacketConn); ok && c != nil {
-			return c
-		}
-		c, _ := icmp.ListenPacket("ip4:icmp", "")
-		return c
-	}
-	if c, ok := icmpV6Pool.Get().(*icmp.PacketConn); ok && c != nil {
-		return c
-	}
-	c, _ := icmp.ListenPacket("ip6:ipv6-icmp", "")
-	return c
-}
-
-func putICMPConn(v4 bool, c *icmp.PacketConn) {
-	if c == nil {
-		return
-	}
-	if v4 {
-		icmpV4Pool.Put(c)
-	} else {
-		icmpV6Pool.Put(c)
-	}
 }
 
 type prober struct {
@@ -562,92 +524,6 @@ func setLinger0(conn net.Conn) {
 	_ = tc.SetLinger(0)
 }
 
-func pingOnce(ctx context.Context, ip net.IP) error {
-	if ip == nil {
-		return errors.New("nil ip")
-	}
-
-	if ip4 := ip.To4(); ip4 != nil {
-		return pingICMP(ctx, "ip4:icmp", ip4, ipv4.ICMPTypeEcho, ipv4.ICMPTypeEchoReply)
-	}
-	return pingICMP(ctx, "ip6:ipv6-icmp", ip, ipv6.ICMPTypeEchoRequest, ipv6.ICMPTypeEchoReply)
-}
-
-func pingICMP(ctx context.Context, network string, ip net.IP, echoType, replyType icmp.Type) error {
-	isV4 := strings.HasPrefix(network, "ip4:")
-	c := getICMPConn(isV4)
-	if c == nil {
-		return errors.New("icmp listen failed")
-	}
-	defer putICMPConn(isV4, c)
-
-	idSeq := icmpIDSeq.Add(1)
-	id := int(idSeq & 0xffff)
-	seq := int((idSeq >> 16) & 0xffff)
-	msg := icmp.Message{
-		Type: echoType,
-		Code: 0,
-		Body: &icmp.Echo{
-			ID:   id,
-			Seq:  seq,
-			Data: []byte("coredns-speedcheck"),
-		},
-	}
-	b, err := msg.Marshal(nil)
-	if err != nil {
-		return err
-	}
-
-	dst := &net.IPAddr{IP: ip}
-	if _, err := c.WriteTo(b, dst); err != nil {
-		return err
-	}
-
-	bufPtr := icmpBufPool.Get().(*[]byte)
-	defer icmpBufPool.Put(bufPtr)
-	buf := *bufPtr
-	if dl, ok := ctx.Deadline(); ok {
-		_ = c.SetReadDeadline(dl)
-	}
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = c.SetReadDeadline(time.Now())
-		case <-done:
-		}
-	}()
-	defer close(done)
-	for {
-		n, peer, err := c.ReadFrom(buf)
-		if err != nil {
-			return err
-		}
-		_ = peer
-		rm, err := icmp.ParseMessage(icmpProtocol(network), buf[:n])
-		if err != nil {
-			continue
-		}
-		if rm.Type != replyType {
-			continue
-		}
-		body, ok := rm.Body.(*icmp.Echo)
-		if !ok {
-			continue
-		}
-		if body.ID != id || body.Seq != seq {
-			continue
-		}
-		return nil
-	}
-}
-
-func icmpProtocol(network string) int {
-	if strings.HasPrefix(network, "ip4:") {
-		return 1
-	}
-	return 58
-}
 
 func sanitizeHost(host string) string {
 	host = strings.ReplaceAll(host, "\r", "")
