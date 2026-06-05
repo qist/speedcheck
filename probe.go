@@ -23,13 +23,6 @@ var defaultDialer = net.Dialer{
 	Control: tcpFastOpenControl,
 }
 
-var icmpBufPool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, 1500)
-		return &buf
-	},
-}
-
 var baseTLSConfig = &tls.Config{InsecureSkipVerify: true}
 
 // --- HTTP/3 transport pool (per host) ---

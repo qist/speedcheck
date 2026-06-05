@@ -250,11 +250,8 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 					return msg.Rcode, err
 				}
 			} else {
-				if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeAAAA, msg.Answer, checks, ipPrefV6First, false); ok {
-					selected := s.selectFastestWith(ctx, host, dns.TypeAAAA, msg.Answer, checks, ipPrefV6First, false)
-					if selected != nil {
-						msg.Answer = selected
-					}
+				if selected := s.selectFastestWith(ctx, host, dns.TypeAAAA, msg.Answer, checks, ipPrefV6First, false); selected != nil {
+					msg.Answer = selected
 					state := request.Request{W: w, Req: r}
 					state.SizeAndDo(msg)
 					_ = w.WriteMsg(msg)
@@ -451,14 +448,9 @@ func (s *SpeedCheck) selectFastestWith(ctx context.Context, host string, qtype u
 	key := bestIP.String()
 	bestRRs := rrByIP[key]
 	if len(bestRRs) == 0 {
-		// Cross-family win: AAAA query but IPv4 won (or vice versa)
-		// Cache under the actual record type so next same-family query hits
-		cacheType := dns.TypeA
-		if bestIP.To4() == nil {
-			cacheType = dns.TypeAAAA
-		}
-		s.cache.Set(host, cacheType, key, time.Now())
-		speedcheckDebugf("cross-family win host=%s qtype=%d bestIP=%s cacheType=%d", host, qtype, key, cacheType)
+		// Cross-family win: AAAA query but IPv4 won (or vice versa).
+		// No matching RRs in the original answer; fall through to caller's fallback.
+		speedcheckDebugf("cross-family win host=%s qtype=%d bestIP=%s", host, qtype, key)
 		return nil
 	}
 	s.cache.Set(host, qtype, key, time.Now())
@@ -493,14 +485,14 @@ func (s *SpeedCheck) findOverride(host string) (hostOverride, bool) {
 		return ov, true
 	}
 	for {
+		if ov, ok := s.cfg.hostOverrides["*."+host]; ok {
+			return ov, true
+		}
 		dot := strings.IndexByte(host, '.')
 		if dot < 0 {
 			break
 		}
 		host = host[dot+1:]
-		if ov, ok := s.cfg.hostOverrides["*."+host]; ok {
-			return ov, true
-		}
 	}
 	return hostOverride{}, false
 }

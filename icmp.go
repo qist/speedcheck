@@ -1,5 +1,3 @@
-//go:build !linux
-
 package speedcheck
 
 import (
@@ -14,9 +12,9 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
-// --- ICMP engine (macOS / Windows / other) ---
+// --- ICMP engine (all platforms) ---
 // Uses golang.org/x/net/icmp with per-ping sockets.
-// Simpler than the Linux version; no epoll issues on these platforms.
+// No raw socket / CAP_NET_RAW required.
 
 var icmpIDSeq atomic.Uint32
 

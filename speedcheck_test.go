@@ -1040,7 +1040,7 @@ func TestHostOverrideWildcardMatchesDeepSubdomain(t *testing.T) {
 	}
 }
 
-func TestHostOverrideWildcardDoesNotMatchBareDomain(t *testing.T) {
+func TestHostOverrideWildcardMatchesBareDomain(t *testing.T) {
 	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 		m := new(dns.Msg)
 		m.SetReply(r)
@@ -1072,9 +1072,9 @@ func TestHostOverrideWildcardDoesNotMatchBareDomain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
-	// wildcard should NOT match bare domain, AAAA should be preserved
-	if len(w.msg.Answer) != 1 {
-		t.Fatalf("expected 1 AAAA answer (wildcard should not match bare domain), got %d", len(w.msg.Answer))
+	// wildcard *.example.com should also match bare domain example.com
+	if len(w.msg.Answer) != 0 {
+		t.Fatalf("expected empty AAAA (wildcard matches bare domain), got %d answers", len(w.msg.Answer))
 	}
 }
 
