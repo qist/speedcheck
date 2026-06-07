@@ -17,10 +17,26 @@ import (
 type fakeProber struct {
 	ip net.IP
 	ok bool
+	v4 net.IP // for pickBestBoth
+	v6 net.IP // for pickBestBoth
 }
 
 func (f fakeProber) pickBest(ctx context.Context, host string, pref ipPreference, ips []net.IP, checks []checkSpec) (net.IP, bool) {
 	return f.ip, f.ok
+}
+
+func (f fakeProber) pickBestBoth(ctx context.Context, host string, ips []net.IP, checks []checkSpec) (net.IP, net.IP) {
+	if !f.ok {
+		return nil, nil
+	}
+	if f.v4 != nil || f.v6 != nil {
+		return f.v4, f.v6
+	}
+	// Fallback: use f.ip for whichever family it belongs to.
+	if f.ip != nil && f.ip.To4() != nil {
+		return f.ip, nil
+	}
+	return nil, f.ip
 }
 
 type countingProber struct {
@@ -34,6 +50,17 @@ func (c *countingProber) pickBest(ctx context.Context, host string, pref ipPrefe
 	return c.ip, c.ok
 }
 
+func (c *countingProber) pickBestBoth(ctx context.Context, host string, ips []net.IP, checks []checkSpec) (net.IP, net.IP) {
+	c.count++
+	if !c.ok {
+		return nil, nil
+	}
+	if c.ip != nil && c.ip.To4() != nil {
+		return c.ip, nil
+	}
+	return nil, c.ip
+}
+
 type capturePrefProber struct {
 	pref ipPreference
 	ip   net.IP
@@ -43,6 +70,16 @@ type capturePrefProber struct {
 func (c *capturePrefProber) pickBest(ctx context.Context, host string, pref ipPreference, ips []net.IP, checks []checkSpec) (net.IP, bool) {
 	c.pref = pref
 	return c.ip, c.ok
+}
+
+func (c *capturePrefProber) pickBestBoth(ctx context.Context, host string, ips []net.IP, checks []checkSpec) (net.IP, net.IP) {
+	if !c.ok {
+		return nil, nil
+	}
+	if c.ip != nil && c.ip.To4() != nil {
+		return c.ip, nil
+	}
+	return nil, c.ip
 }
 
 type captureChecksProber struct {
@@ -56,10 +93,32 @@ func (c *captureChecksProber) pickBest(ctx context.Context, host string, pref ip
 	return c.ip, c.ok
 }
 
+func (c *captureChecksProber) pickBestBoth(ctx context.Context, host string, ips []net.IP, checks []checkSpec) (net.IP, net.IP) {
+	c.checks = append([]checkSpec(nil), checks...)
+	if !c.ok {
+		return nil, nil
+	}
+	if c.ip != nil && c.ip.To4() != nil {
+		return c.ip, nil
+	}
+	return nil, c.ip
+}
+
 type ipPickerFunc func(ctx context.Context, host string, pref ipPreference, ips []net.IP, checks []checkSpec) (net.IP, bool)
 
 func (f ipPickerFunc) pickBest(ctx context.Context, host string, pref ipPreference, ips []net.IP, checks []checkSpec) (net.IP, bool) {
 	return f(ctx, host, pref, ips, checks)
+}
+
+func (f ipPickerFunc) pickBestBoth(ctx context.Context, host string, ips []net.IP, checks []checkSpec) (net.IP, net.IP) {
+	ip, ok := f(ctx, host, ipPrefNone, ips, checks)
+	if !ok {
+		return nil, nil
+	}
+	if ip != nil && ip.To4() != nil {
+		return ip, nil
+	}
+	return nil, ip
 }
 
 type msgWriter struct {
@@ -200,8 +259,8 @@ speedcheck {
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
-	if !sc.cfg.parallelIPs {
-		t.Fatalf("expected parallelIPs enabled")
+	if sc.cfg.ipParallelMode != ipParallelOn {
+		t.Fatalf("expected ipParallelMode on, got %v", sc.cfg.ipParallelMode)
 	}
 }
 
@@ -225,7 +284,7 @@ func TestSpeedIPParallelForcesRaceMode(t *testing.T) {
 			checks:      []checkSpec{{kind: checkTCP, port: 80}},
 			timeout:     1 * time.Second,
 			ipPref:      ipPrefV6First,
-			parallelIPs: true,
+			ipParallelMode: ipParallelOn,
 		},
 		prober: cp,
 	}
@@ -420,7 +479,7 @@ func TestAAAAQueryParallelIPReturnsFastestIPv6(t *testing.T) {
 		cfg: config{
 			enabled:     true,
 			timeout:     1 * time.Second,
-			parallelIPs: true,
+			ipParallelMode: ipParallelOn,
 		},
 		prober: fakeProber{ip: net.ParseIP("2001:db8::1"), ok: true},
 	}
@@ -467,7 +526,7 @@ func TestAAAAQueryParallelIPProbeFailFallbackToAAAA(t *testing.T) {
 		cfg: config{
 			enabled:     true,
 			timeout:     1 * time.Second,
-			parallelIPs: true,
+			ipParallelMode: ipParallelOn,
 		},
 		prober: fakeProber{ip: nil, ok: false},
 	}
@@ -930,7 +989,7 @@ func TestHostOverrideUsesCustomChecksAndForcesNoParallelIPs(t *testing.T) {
 		Next: backend,
 		cfg: config{
 			enabled:     true,
-			parallelIPs: true,
+			ipParallelMode: ipParallelOn,
 			ipPref:      ipPrefV6First,
 			checks:      []checkSpec{{kind: checkTCP, port: 80}},
 			hostOverrides: map[string]hostOverride{
@@ -1122,5 +1181,435 @@ func TestHostOverrideExactMatchTakesPrecedenceOverWildcard(t *testing.T) {
 	// exact match should win: checks should be tcp:8080, not tcp:443
 	if len(cp.checks) != 1 || cp.checks[0].port != 8080 {
 		t.Fatalf("expected exact match override (tcp:8080), got %#v", cp.checks)
+	}
+}
+
+func TestParseSpeedIPParallelWinner(t *testing.T) {
+	c := caddy.NewTestController("dns", `
+speedcheck {
+  speed-check-mode tcp:80
+  speed-ip-parallel winner
+}
+`)
+	sc, err := parse(c)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if sc.cfg.ipParallelMode != ipParallelWinner {
+		t.Fatalf("expected ipParallelMode winner, got %v", sc.cfg.ipParallelMode)
+	}
+}
+
+func TestWinnerAQueryV4WinsReturnsA(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::1")},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("2.2.2.2").To4()},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	// "winner" mode: TypeA query, v4 wins → return A record
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled:        true,
+			checks:         []checkSpec{{kind: checkTCP, port: 80}},
+			timeout:        1 * time.Second,
+			ipParallelMode: ipParallelWinner,
+		},
+		prober: fakeProber{ip: net.ParseIP("2.2.2.2").To4(), ok: true},
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.org.", dns.TypeA)
+
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if w.msg == nil {
+		t.Fatalf("expected response")
+	}
+	if len(w.msg.Answer) != 1 {
+		t.Fatalf("expected 1 A answer, got %d", len(w.msg.Answer))
+	}
+	a, ok := w.msg.Answer[0].(*dns.A)
+	if !ok {
+		t.Fatalf("expected A record, got %T", w.msg.Answer[0])
+	}
+	if got := a.A.String(); got != "2.2.2.2" {
+		t.Fatalf("expected 2.2.2.2, got %s", got)
+	}
+}
+
+func TestWinnerAQuerySameAsOnMode(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("2.2.2.2").To4()},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	// "winner" mode for TypeA: same as "on" — race A records only
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled:        true,
+			checks:         []checkSpec{{kind: checkTCP, port: 80}},
+			timeout:        1 * time.Second,
+			ipParallelMode: ipParallelWinner,
+		},
+		prober: fakeProber{ip: net.ParseIP("2.2.2.2").To4(), ok: true},
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.org.", dns.TypeA)
+
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if w.msg == nil {
+		t.Fatalf("expected response")
+	}
+	if len(w.msg.Answer) != 1 {
+		t.Fatalf("expected 1 A answer, got %d", len(w.msg.Answer))
+	}
+	a, ok := w.msg.Answer[0].(*dns.A)
+	if !ok {
+		t.Fatalf("expected A record, got %T", w.msg.Answer[0])
+	}
+	if got := a.A.String(); got != "2.2.2.2" {
+		t.Fatalf("expected 2.2.2.2, got %s", got)
+	}
+}
+
+func TestFastestAnyAQueryV4FasterReturnsA(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::1")},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled:    true,
+			checks:     []checkSpec{{kind: checkTCP, port: 80}},
+			timeout:    1 * time.Second,
+			ipParallelMode: ipParallelWinner,
+		},
+		prober: fakeProber{ip: net.ParseIP("1.1.1.1").To4(), ok: true},
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.org.", dns.TypeA)
+
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if w.msg == nil {
+		t.Fatalf("expected response")
+	}
+	if len(w.msg.Answer) != 1 {
+		t.Fatalf("expected 1 A answer, got %d", len(w.msg.Answer))
+	}
+	a, ok := w.msg.Answer[0].(*dns.A)
+	if !ok {
+		t.Fatalf("expected A record, got %T", w.msg.Answer[0])
+	}
+	if got := a.A.String(); got != "1.1.1.1" {
+		t.Fatalf("expected 1.1.1.1, got %s", got)
+	}
+}
+
+func TestWinnerAAAQueryV6WinsReturnsAAAA(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::1")},
+			&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::2")},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	// "winner" mode: TypeAAAA query, v6 wins → return AAAA record
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled:        true,
+			checks:         []checkSpec{{kind: checkTCP, port: 80}},
+			timeout:        1 * time.Second,
+			ipParallelMode: ipParallelWinner,
+		},
+		prober: fakeProber{ip: net.ParseIP("2001:db8::2"), ok: true},
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.org.", dns.TypeAAAA)
+
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if w.msg == nil {
+		t.Fatalf("expected response")
+	}
+	if len(w.msg.Answer) != 1 {
+		t.Fatalf("expected 1 AAAA answer, got %d", len(w.msg.Answer))
+	}
+	aaaa, ok := w.msg.Answer[0].(*dns.AAAA)
+	if !ok {
+		t.Fatalf("expected AAAA record, got %T", w.msg.Answer[0])
+	}
+	if got := aaaa.AAAA.String(); got != "2001:db8::2" {
+		t.Fatalf("expected 2001:db8::2, got %s", got)
+	}
+}
+
+func TestWinnerAAAAQueryV4WinsReturnsEmpty(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		switch r.Question[0].Qtype {
+		case dns.TypeA:
+			m.Answer = []dns.RR{
+				&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+			}
+		case dns.TypeAAAA:
+			m.Answer = []dns.RR{
+				&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::1")},
+			}
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	// "winner" mode: TypeAAAA query, v4 wins → return empty (NOERROR)
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled:        true,
+			checks:         []checkSpec{{kind: checkTCP, port: 80}},
+			timeout:        1 * time.Second,
+			ipParallelMode: ipParallelWinner,
+		},
+		prober: fakeProber{ip: net.ParseIP("1.1.1.1").To4(), ok: true},
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.org.", dns.TypeAAAA)
+
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if w.msg == nil {
+		t.Fatalf("expected response")
+	}
+	if w.msg.Rcode != dns.RcodeSuccess {
+		t.Fatalf("expected NOERROR, got %d", w.msg.Rcode)
+	}
+	if len(w.msg.Answer) != 0 {
+		t.Fatalf("expected empty answer (cross-family v4 wins), got %d answers", len(w.msg.Answer))
+	}
+}
+
+func TestFastestAnyAAAAQueryV6FasterReturnsAAAA(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::1")},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled:    true,
+			checks:     []checkSpec{{kind: checkTCP, port: 80}},
+			timeout:    1 * time.Second,
+			ipParallelMode: ipParallelWinner,
+		},
+		prober: fakeProber{ip: net.ParseIP("2001:db8::1"), ok: true},
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.org.", dns.TypeAAAA)
+
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if w.msg == nil {
+		t.Fatalf("expected response")
+	}
+	if len(w.msg.Answer) != 1 {
+		t.Fatalf("expected 1 AAAA answer, got %d", len(w.msg.Answer))
+	}
+	if _, ok := w.msg.Answer[0].(*dns.AAAA); !ok {
+		t.Fatalf("expected AAAA record, got %T", w.msg.Answer[0])
+	}
+}
+
+func TestFastestAnyProbeFailFallbackToMatchingFamily(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::1")},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled:    true,
+			checks:     []checkSpec{{kind: checkTCP, port: 80}},
+			timeout:    1 * time.Second,
+			ipParallelMode: ipParallelWinner,
+		},
+		prober: fakeProber{ip: nil, ok: false},
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.org.", dns.TypeA)
+
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if w.msg == nil {
+		t.Fatalf("expected response")
+	}
+	if len(w.msg.Answer) != 1 {
+		t.Fatalf("expected 1 A answer (fallback), got %d", len(w.msg.Answer))
+	}
+	if _, ok := w.msg.Answer[0].(*dns.A); !ok {
+		t.Fatalf("expected A record fallback, got %T", w.msg.Answer[0])
+	}
+}
+
+func TestFastestAnyForcesRaceModeIgnoresIPPref(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::1")},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	// Track all pickBest calls to verify winner mode uses ipPrefNone for cross-family race.
+	var capturedPrefs []ipPreference
+	cp := ipPickerFunc(func(ctx context.Context, host string, pref ipPreference, ips []net.IP, checks []checkSpec) (net.IP, bool) {
+		capturedPrefs = append(capturedPrefs, pref)
+		return net.ParseIP("1.1.1.1").To4(), true
+	})
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled:        true,
+			checks:         []checkSpec{{kind: checkTCP, port: 80}},
+			timeout:        1 * time.Second,
+			ipPref:         ipPrefV6First,
+			ipParallelMode: ipParallelWinner,
+		},
+		prober: cp,
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.org.", dns.TypeA)
+
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	// First call is from pickBestAcrossFamilies (must use ipPrefNone for cross-family race).
+	if len(capturedPrefs) == 0 || capturedPrefs[0] != ipPrefNone {
+		t.Fatalf("expected first pickBest call to use ipPrefNone, got %v", capturedPrefs)
+	}
+}
+
+func TestParallelOnRacesOnlyMatchingFamily(t *testing.T) {
+	backend := plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{
+			&dns.AAAA{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 10}, AAAA: net.ParseIP("2001:db8::1")},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("1.1.1.1").To4()},
+			&dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("2.2.2.2").To4()},
+		}
+		_ = w.WriteMsg(m)
+		return dns.RcodeSuccess, nil
+	})
+
+	// "on" mode: TypeA query → only A records raced, AAAA ignored
+	sc := &SpeedCheck{
+		Next: backend,
+		cfg: config{
+			enabled:        true,
+			checks:         []checkSpec{{kind: checkTCP, port: 80}},
+			timeout:        1 * time.Second,
+			ipParallelMode: ipParallelOn,
+		},
+		prober: fakeProber{ip: net.ParseIP("2.2.2.2").To4(), ok: true},
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.org.", dns.TypeA)
+
+	w := &msgWriter{}
+	_, err := sc.ServeDNS(context.Background(), w, req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if w.msg == nil {
+		t.Fatalf("expected response")
+	}
+	if len(w.msg.Answer) != 1 {
+		t.Fatalf("expected 1 A answer, got %d", len(w.msg.Answer))
+	}
+	a, ok := w.msg.Answer[0].(*dns.A)
+	if !ok {
+		t.Fatalf("expected A record, got %T", w.msg.Answer[0])
+	}
+	if got := a.A.String(); got != "2.2.2.2" {
+		t.Fatalf("expected 2.2.2.2, got %s", got)
 	}
 }

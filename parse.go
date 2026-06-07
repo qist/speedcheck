@@ -35,6 +35,14 @@ const (
 	checkHTTP
 )
 
+type ipParallelMode int
+
+const (
+	ipParallelOff    ipParallelMode = iota // disabled
+	ipParallelOn                           // race all, first wins (cross-family passes through)
+	ipParallelWinner                       // race all, truly fastest wins (cross-family returns empty)
+)
+
 type checkSpec struct {
 	kind checkKind
 	port uint16
@@ -44,10 +52,10 @@ type config struct {
 	enabled          bool
 	checks           []checkSpec
 	ipPref           ipPreference
+	ipParallelMode   ipParallelMode
 	timeout          time.Duration
 	cacheTTL         time.Duration
 	parallelChecks   bool
-	parallelIPs      bool
 	httpSend         []byte
 	httpAliveClasses map[httpAliveClass]struct{}
 	hostOverrides    map[string]hostOverride
@@ -353,10 +361,13 @@ func parseSpeedIPParallel(cfg *config, args []string) error {
 	}
 	switch strings.ToLower(strings.TrimSpace(args[0])) {
 	case "on", "true", "1", "yes":
-		cfg.parallelIPs = true
+		cfg.ipParallelMode = ipParallelOn
 		return nil
 	case "off", "false", "0", "no":
-		cfg.parallelIPs = false
+		cfg.ipParallelMode = ipParallelOff
+		return nil
+	case "winner":
+		cfg.ipParallelMode = ipParallelWinner
 		return nil
 	default:
 		return fmt.Errorf("invalid speed-ip-parallel %q", args[0])

@@ -27,7 +27,7 @@ speedcheck {
     speed-check-parallel off
     speed-cache-ttl 30s
     speed-ip-mode ipv4,ipv6
-    speed-ip-parallel off
+    speed-ip-parallel off          # off | on | winner
     speed-host-override *.example.com|tcp:443,http:443|ipv4,ipv6
     check_http_send "HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
     check_http_expect_alive http_2xx http_3xx http_4xx
@@ -70,9 +70,22 @@ IP 家族优先级，默认 `ipv6,ipv4`（优先 IPv6）。
 
 ### speed-ip-parallel
 
-是否并发竞速 v4/v6（`on` / `off`），默认 `off`。
+v4/v6 并发竞速模式（`off` / `on` / `winner`），默认 `off`。
 
-开启后忽略 `speed-ip-mode` 的家族优先级，将所有 A/AAAA 的 IP 合并后并发探测，返回最先成功的 IP。当查询类型为 AAAA 且 IPv4 获胜时，返回空 AAAA（促使客户端回落使用 A 记录）。
+开启后忽略 `speed-ip-mode` 的家族优先级，将所有 A/AAAA 的 IP 合并后并发探测。
+
+| 值 | 含义 |
+|---|---|
+| `off` | 关闭竞速，按 `speed-ip-mode` 的家族优先级分别测速 |
+| `on` | 并发竞速，请求 A 就测速 A 记录返回最快的 A，请求 AAAA 就测速 AAAA 返回最快的 AAAA |
+| `winner` | AAAA 查询跨家族竞速：收集 AAAA + 向上游请求 A，合并竞速；v6 赢返回 AAAA，v4 赢返回 NOERROR（drop AAAA）；A 查询与 `on` 行为一致 |
+
+`winner` 模式行为：
+- TypeA 查询：与 `on` 相同，只测速 A 记录
+- TypeAAAA 查询：收集 AAAA + 向上游请求 A，合并竞速；v6 赢返回最快 AAAA，v4 赢返回 NOERROR + 非 AAAA 记录（CNAME 等）
+- 全部不通：回落到匹配查询类型的首个 IP
+
+不通的 IP 处理：探测失败的 IP 直接跳过。`on` 模式仅测速同家族；`winner` 模式对 AAAA 查询做跨家族竞速。
 
 ### speed-host-override
 
@@ -120,7 +133,7 @@ speed-host-override <host> <check-mode> <ip-mode>
 #### 命中 override 后的行为
 
 - 使用该域名专属的 `check-mode` 与 `ip-mode`
-- 禁用 `speed-ip-parallel` 的 v4/v6 竞速
+- 禁用 `speed-ip-parallel` 的 v4/v6 竞速（`on` 和 `winner` 模式均不生效）
 
 ### check_http_send
 
@@ -216,6 +229,24 @@ HTTP 探测可接受的状态码分类，可多选：
 }
 ~~~
 
+### 真正最快 IP 模式
+
+使用 `winner` 模式，v4/v6 同时测速，真正最快的 IP 获胜。若获胜 IP 的家族与查询类型不同，返回空记录促使客户端回落：
+
+~~~ corefile
+. {
+    speedcheck {
+        speed-check-mode tcp:443
+        speed-timeout-mode 2s
+        speed-ip-parallel winner
+        speed-check-parallel on
+    }
+    forward . 8.8.8.8
+}
+~~~
+
+例如：客户端查询 A 记录，但 IPv6 的 443 端口响应更快，则返回空 A 记录，客户端会自动尝试 AAAA 查询获取 IPv6 地址。
+
 ## Notes
 
 - ICMP ping 需要 `CAP_NET_RAW` 权限或 root 权限；缺少权限时 ping 探测会静默失败，不影响其他探测模式
@@ -223,6 +254,12 @@ HTTP 探测可接受的状态码分类，可多选：
 - 探测连接不复用，每次探测都是新建连接，以准确测量连接建立延迟
 - 缓存按 `域名+查询类型` 存储，过期条目在访问时自动清理
 - 探测并发上限为 32 个 IP；超出时排队等待，防止协程爆炸
+
+## Download
+
+编译好的二进制文件（含 speedcheck 插件）：
+
+https://github.com/qist/coredns-plugins-suite/releases
 
 ## Build
 
@@ -257,5 +294,5 @@ make
 交叉编译（Linux arm64）：
 
 ~~~ txt
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o coredns-linux-arm64
+make -f Makefile.release release
 ~~~

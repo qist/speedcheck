@@ -95,6 +95,7 @@ type prober struct {
 
 type ipPicker interface {
 	pickBest(ctx context.Context, host string, pref ipPreference, ips []net.IP, checks []checkSpec) (net.IP, bool)
+	pickBestBoth(ctx context.Context, host string, ips []net.IP, checks []checkSpec) (bestV4, bestV6 net.IP)
 }
 
 func newDefaultProber(timeout time.Duration, parallelChecks bool, httpSend []byte, httpAliveClasses map[httpAliveClass]struct{}) *prober {
@@ -310,6 +311,104 @@ func (p *prober) pickBest(ctx context.Context, host string, pref ipPreference, i
 		}
 	}
 	return nil, false
+}
+
+// pickBestBoth races all IPs concurrently and returns the first successful IPv4
+// and first successful IPv6 independently. Failed IPs are simply ignored — the
+// caller receives nil for any family that had no success.
+func (p *prober) pickBestBoth(ctx context.Context, host string, ips []net.IP, checks []checkSpec) (bestV4, bestV6 net.IP) {
+	if len(ips) == 0 {
+		return nil, nil
+	}
+
+	probeCtx, cancel := context.WithCancel(ctx)
+	timer := time.AfterFunc(p.timeout, cancel)
+	defer timer.Stop()
+	defer cancel()
+
+	type outcome struct {
+		ip net.IP
+		ok bool
+	}
+	resultCh := make(chan outcome, len(ips))
+
+	v4Total := 0
+	v6Total := 0
+	for _, ip := range ips {
+		if ip.To4() == nil {
+			v6Total++
+		} else {
+			v4Total++
+		}
+	}
+
+	var sem chan struct{}
+	if p.maxConcurrency > 0 && len(ips) > p.maxConcurrency {
+		sem = make(chan struct{}, p.maxConcurrency)
+	}
+	for _, ip := range ips {
+		ip := ip
+		if sem != nil {
+			sem <- struct{}{}
+		}
+		go func() {
+			if sem != nil {
+				defer func() { <-sem }()
+			}
+			_, ok := p.probeIP(probeCtx, ip, host, checks)
+			resultCh <- outcome{ip: ip, ok: ok}
+		}()
+	}
+
+	v4Remain := v4Total
+	v6Remain := v6Total
+	for remaining := len(ips); remaining > 0; remaining-- {
+		select {
+		case <-probeCtx.Done():
+			return bestV4, bestV6
+		case r := <-resultCh:
+			if !r.ok {
+				if r.ip.To4() == nil {
+					v6Remain--
+				} else {
+					v4Remain--
+				}
+				if bestV4 != nil && bestV6 != nil {
+					return bestV4, bestV6
+				}
+				if bestV4 != nil && v6Remain == 0 {
+					return bestV4, bestV6
+				}
+				if bestV6 != nil && v4Remain == 0 {
+					return bestV4, bestV6
+				}
+				continue
+			}
+
+			if r.ip.To4() != nil {
+				v4Remain--
+				if bestV4 == nil {
+					bestV4 = r.ip
+				}
+			} else {
+				v6Remain--
+				if bestV6 == nil {
+					bestV6 = r.ip
+				}
+			}
+
+			if bestV4 != nil && bestV6 != nil {
+				return bestV4, bestV6
+			}
+			if bestV4 != nil && v6Remain == 0 {
+				return bestV4, bestV6
+			}
+			if bestV6 != nil && v4Remain == 0 {
+				return bestV4, bestV6
+			}
+		}
+	}
+	return bestV4, bestV6
 }
 
 func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []checkSpec) (time.Duration, bool) {
