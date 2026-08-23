@@ -25,13 +25,56 @@ var defaultDialer = net.Dialer{
 
 var baseTLSConfig = &tls.Config{InsecureSkipVerify: true}
 
+// bufioReaderPool reuses bufio.Reader objects to avoid per-probe allocation.
+var bufioReaderPool = sync.Pool{
+	New: func() any { return bufio.NewReaderSize(nil, 4096) },
+}
+
+// httpSendCache caches the rendered HTTP request bytes per host to avoid
+// repeated string replacements on every probe.
+var (
+	httpSendCacheMu sync.RWMutex
+	httpSendCache   = make(map[string][]byte, 64)
+)
+
+func httpSendBytesCached(httpSend []byte, host string) []byte {
+	host = sanitizeHost(host)
+
+	// Check cache first
+	httpSendCacheMu.RLock()
+	if cached, ok := httpSendCache[host]; ok {
+		httpSendCacheMu.RUnlock()
+		return cached
+	}
+	httpSendCacheMu.RUnlock()
+
+	// Build and cache
+	var result []byte
+	if len(httpSend) == 0 {
+		result = []byte("GET / HTTP/1.0\r\n\r\n")
+	} else {
+		s := strings.ReplaceAll(string(httpSend), "{host}", host)
+		s = strings.ReplaceAll(s, "{HOST}", host)
+		result = []byte(s)
+	}
+
+	httpSendCacheMu.Lock()
+	if len(httpSendCache) < 256 {
+		httpSendCache[host] = result
+	}
+	httpSendCacheMu.Unlock()
+
+	return result
+}
+
 // --- HTTP/3 transport pool (per host) ---
 
 const h3TransportTTL = 5 * time.Minute
 
 var (
-	h3TransportPool sync.Map // key: host(string) -> *h3TransportEntry
-	h3CleanupOnce   sync.Once
+	h3TransportPool  sync.Map // key: host(string) -> *h3TransportEntry
+	h3CleanupOnce    sync.Once
+	h3CleanupStopCh  = make(chan struct{})
 )
 
 type h3TransportEntry struct {
@@ -70,18 +113,40 @@ func startH3Cleanup() {
 	go func() {
 		ticker := time.NewTicker(h3TransportTTL)
 		defer ticker.Stop()
-		for range ticker.C {
-			now := time.Now()
-			h3TransportPool.Range(func(key, value any) bool {
-				entry := value.(*h3TransportEntry)
-				if now.Sub(entry.created) >= h3TransportTTL {
-					h3TransportPool.Delete(key)
-					entry.tr.Close()
-				}
-				return true
-			})
+		for {
+			select {
+			case <-ticker.C:
+				now := time.Now()
+				h3TransportPool.Range(func(key, value any) bool {
+					entry := value.(*h3TransportEntry)
+					if now.Sub(entry.created) >= h3TransportTTL {
+						h3TransportPool.Delete(key)
+						entry.tr.Close()
+					}
+					return true
+				})
+			case <-h3CleanupStopCh:
+				return
+			}
 		}
 	}()
+}
+
+// stopH3Cleanup stops the H3 transport cleanup goroutine and closes all
+// pooled transports. Called during plugin shutdown.
+func stopH3Cleanup() {
+	select {
+	case <-h3CleanupStopCh:
+		// already closed
+	default:
+		close(h3CleanupStopCh)
+	}
+	h3TransportPool.Range(func(key, value any) bool {
+		entry := value.(*h3TransportEntry)
+		entry.tr.Close()
+		h3TransportPool.Delete(key)
+		return true
+	})
 }
 
 type prober struct {
@@ -439,7 +504,9 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 		others = append(others, c)
 	}
 
-	speedcheckDebugf("probe ip=%s host=%s ping=%t others=%d parallel=%t timeout=%s", ip.String(), host, pingSeen, len(others), p.parallelChecks, p.timeout)
+	if speedcheckDebug {
+		speedcheckDebugf("probe ip=%s host=%s ping=%t others=%d parallel=%t timeout=%s", ip.String(), host, pingSeen, len(others), p.parallelChecks, p.timeout)
+	}
 
 	if pingSeen && (!p.parallelChecks || len(others) == 0) {
 		start := time.Now()
@@ -470,12 +537,11 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 			go func() {
 				start := time.Now()
 				ctxPing, cancelPing := context.WithTimeout(ctx2, p.timeout)
-				left := ctxLeft(ctxPing)
 				err := p.pingFn(ctxPing, ip)
 				cancelPing()
 				d := time.Since(start)
-				if shouldLogProbeErr(err) {
-					speedcheckDebugf("check host=%s ip=%s kind=%s ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(checkPing), err == nil, d, left, err, errDetails(err))
+				if speedcheckDebug && shouldLogProbeErr(err) {
+					speedcheckDebugf("check host=%s ip=%s kind=%s ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(checkPing), err == nil, d, ctxLeft(ctxPing), err, errDetails(err))
 				}
 				resultCh <- probeResult{kind: checkPing, d: d, ok: err == nil, err: err}
 			}()
@@ -484,26 +550,27 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 			c := c
 			go func() {
 				ctxCheck, cancelCheck := context.WithTimeout(ctx2, p.timeout)
-				left := ctxLeft(ctxCheck)
 				defer cancelCheck()
 				switch c.kind {
 				case checkTCP:
 					start := time.Now()
 					err := tcpConnect(ctxCheck, ip, c.port)
 					d := time.Since(start)
-					if shouldLogProbeErr(err) {
-						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, left, err, errDetails(err))
+					if speedcheckDebug && shouldLogProbeErr(err) {
+						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, ctxLeft(ctxCheck), err, errDetails(err))
 					}
 					resultCh <- probeResult{kind: c.kind, port: c.port, d: d, ok: err == nil, err: err}
 				case checkHTTP:
 					d, err := p.httpProbe(ctxCheck, ip, c.port, host)
-					if shouldLogProbeErr(err) {
-						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, left, err, errDetails(err))
+					if speedcheckDebug && shouldLogProbeErr(err) {
+						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, ctxLeft(ctxCheck), err, errDetails(err))
 					}
 					resultCh <- probeResult{kind: c.kind, port: c.port, d: d, ok: err == nil, err: err}
 				default:
 					err := errors.New("unknown check kind")
-					speedcheckDebugf("check host=%s ip=%s kind=%s ok=%t err=%v", host, ip.String(), checkKindName(c.kind), false, err)
+					if speedcheckDebug {
+						speedcheckDebugf("check host=%s ip=%s kind=%s ok=%t err=%v", host, ip.String(), checkKindName(c.kind), false, err)
+					}
 					resultCh <- probeResult{kind: c.kind, ok: false, err: err}
 				}
 			}()
@@ -540,12 +607,13 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 	} else {
 		for _, c := range others {
 			ctxCheck, cancelCheck := context.WithTimeout(probeCtx, p.timeout)
-			left := ctxLeft(ctxCheck)
 			switch c.kind {
 			case checkTCP:
 				start := time.Now()
 				if err := tcpConnect(ctxCheck, ip, c.port); err == nil {
-					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, true, time.Since(start), left, nil)
+					if speedcheckDebug {
+						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, true, time.Since(start), ctxLeft(ctxCheck), nil)
+					}
 					cancelCheck()
 					if pingOK {
 						return pingDur, true
@@ -558,12 +626,16 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 					}
 					return 0, false
 				} else {
-					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(c.kind), c.port, false, time.Since(start), left, err, errDetails(err))
+					if speedcheckDebug {
+						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(c.kind), c.port, false, time.Since(start), ctxLeft(ctxCheck), err, errDetails(err))
+					}
 				}
 			case checkHTTP:
 				d, err := p.httpProbe(ctxCheck, ip, c.port, host)
 				if err == nil {
-					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, true, d, left, nil)
+					if speedcheckDebug {
+						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, true, d, ctxLeft(ctxCheck), nil)
+					}
 					cancelCheck()
 					if pingOK {
 						return pingDur, true
@@ -576,7 +648,9 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 					}
 					return 0, false
 				} else {
-					speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(c.kind), c.port, false, d, left, err, errDetails(err))
+					if speedcheckDebug {
+						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(c.kind), c.port, false, d, ctxLeft(ctxCheck), err, errDetails(err))
+					}
 				}
 			default:
 				cancelCheck()
@@ -623,14 +697,10 @@ func sanitizeHost(host string) string {
 	return host
 }
 
+// httpSendBytes is retained for backward compatibility but now delegates
+// to the cached version.
 func httpSendBytes(httpSend []byte, host string) []byte {
-	host = sanitizeHost(host)
-	if len(httpSend) == 0 {
-		return []byte("GET / HTTP/1.0\r\n\r\n")
-	}
-	s := strings.ReplaceAll(string(httpSend), "{host}", host)
-	s = strings.ReplaceAll(s, "{HOST}", host)
-	return []byte(s)
+	return httpSendBytesCached(httpSend, host)
 }
 
 func redirectLocationIPFamilyMismatch(location string, probedIP net.IP) bool {
@@ -747,12 +817,14 @@ func (p *prober) http1Probe(ctx context.Context, ip net.IP, port uint16, host st
 		_ = conn.SetDeadline(dl)
 	}
 
-	req := httpSendBytes(p.httpSend, host)
+	req := httpSendBytesCached(p.httpSend, host)
 	if _, err := conn.Write(req); err != nil {
 		return 0, err
 	}
 
-	br := bufio.NewReader(conn)
+	br := bufioReaderPool.Get().(*bufio.Reader)
+	br.Reset(conn)
+	defer bufioReaderPool.Put(br)
 	line, err := br.ReadString('\n')
 	if err != nil {
 		if errors.Is(err, io.EOF) && line == "" {

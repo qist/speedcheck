@@ -652,7 +652,7 @@ func TestCacheSetCleansExpiredEntries(t *testing.T) {
 	cache.mu.RLock()
 	defer cache.mu.RUnlock()
 
-	if _, ok := cache.m[cacheKey("old.example", dns.TypeA)]; ok {
+	if _, ok := cache.m[cacheKey{host: "old.example", qtype: dns.TypeA}]; ok {
 		t.Fatal("expected expired cache entry to be cleaned")
 	}
 }

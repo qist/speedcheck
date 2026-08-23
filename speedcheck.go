@@ -6,7 +6,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +30,7 @@ func (s *SpeedCheck) OnShutdown() {
 	if s.cache != nil {
 		s.cache.Close()
 	}
+	stopH3Cleanup()
 }
 
 var speedcheckDebug = os.Getenv("SPEEDCHECK_DEBUG") != ""
@@ -42,10 +42,16 @@ func speedcheckDebugf(format string, args ...interface{}) {
 	_, _ = fmt.Fprintf(os.Stderr, "speedcheck-debug: "+format+"\n", args...)
 }
 
+// cacheKey is a zero-allocation composite key for the IP cache.
+type cacheKey struct {
+	host  string
+	qtype uint16
+}
+
 type ipCache struct {
 	ttl      time.Duration
 	mu       sync.RWMutex
-	m        map[string]cacheEntry
+	m        map[cacheKey]cacheEntry
 	stopOnce sync.Once
 	stopCh   chan struct{}
 }
@@ -61,22 +67,18 @@ func newIPCache(ttl time.Duration) *ipCache {
 	}
 	c := &ipCache{
 		ttl:    ttl,
-		m:      make(map[string]cacheEntry),
+		m:      make(map[cacheKey]cacheEntry),
 		stopCh: make(chan struct{}),
 	}
 	go c.cleanupLoop()
 	return c
 }
 
-func cacheKey(host string, qtype uint16) string {
-	return host + "|" + strconv.Itoa(int(qtype))
-}
-
 func (c *ipCache) Get(host string, qtype uint16, now time.Time) (string, bool) {
 	if c == nil {
 		return "", false
 	}
-	k := cacheKey(host, qtype)
+	k := cacheKey{host: host, qtype: qtype}
 
 	c.mu.RLock()
 	ent, ok := c.m[k]
@@ -100,7 +102,7 @@ func (c *ipCache) Set(host string, qtype uint16, ip string, now time.Time) {
 	if c == nil {
 		return
 	}
-	k := cacheKey(host, qtype)
+	k := cacheKey{host: host, qtype: qtype}
 	c.mu.Lock()
 	c.m[k] = cacheEntry{ip: ip, expiresAt: now.Add(c.ttl)}
 	c.mu.Unlock()
@@ -111,7 +113,7 @@ func (c *ipCache) Clear() {
 		return
 	}
 	c.mu.Lock()
-	c.m = make(map[string]cacheEntry)
+	c.m = make(map[cacheKey]cacheEntry)
 	c.mu.Unlock()
 }
 
@@ -459,6 +461,18 @@ func (s *SpeedCheck) selectFastestWith(ctx context.Context, host string, qtype u
 	}
 
 	speedcheckDebugf("pickBest failed host=%s qtype=%d ips=%d", host, qtype, len(ips))
+	// Fallback: respect ipPref when choosing a fallback IP.
+	// In parallel mode (ipParMode != off), pref is set to ipPrefNone above,
+	// so the fallback just picks the first available IP.
+	if pref == ipPrefV6First {
+		for _, ip := range ips {
+			if ip.To4() == nil {
+				key := ip.String()
+				speedcheckDebugf("fallback pick first v6 host=%s qtype=%d ip=%s", host, qtype, key)
+				return append(preserved, rrByIP[key]...)
+			}
+		}
+	}
 	for _, ip := range ips {
 		if ip.To4() != nil {
 			key := ip.String()

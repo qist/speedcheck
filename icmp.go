@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,6 +18,14 @@ import (
 // No raw socket / CAP_NET_RAW required.
 
 var icmpIDSeq atomic.Uint32
+
+// icmpBufPool reuses 1500-byte buffers to avoid per-ping allocation.
+var icmpBufPool = sync.Pool{
+	New: func() any { b := make([]byte, 1500); return &b },
+}
+
+// icmpEchoData is the constant payload sent in every echo request.
+var icmpEchoData = []byte("coredns-speedcheck")
 
 func pingOnce(ctx context.Context, ip net.IP) error {
 	if ip == nil {
@@ -52,7 +61,7 @@ func pingOnce(ctx context.Context, ip net.IP) error {
 		Body: &icmp.Echo{
 			ID:   id,
 			Seq:  seq,
-			Data: []byte("coredns-speedcheck"),
+			Data: icmpEchoData,
 		},
 	}
 	b, err := msg.Marshal(nil)
@@ -69,7 +78,12 @@ func pingOnce(ctx context.Context, ip net.IP) error {
 		_ = c.SetReadDeadline(dl)
 	}
 
-	buf := make([]byte, 1500)
+	// Start a goroutine to interrupt ReadFrom when the context is cancelled.
+	// This is needed because icmp.PacketConn doesn't respect context.
+	bufPtr := icmpBufPool.Get().(*[]byte)
+	defer icmpBufPool.Put(bufPtr)
+	buf := *bufPtr
+
 	done := make(chan struct{})
 	go func() {
 		select {
