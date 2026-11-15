@@ -59,6 +59,10 @@ type config struct {
 	httpSend         []byte
 	httpAliveClasses map[httpAliveClass]struct{}
 	hostOverrides    map[string]hostOverride
+	// wildcardOverrides holds the "*." rules indexed by the bare suffix so
+	// the query path can match them without building a key per label.
+	wildcardOverrides map[string]hostOverride
+	hasWildcardRules  bool
 }
 
 type hostOverride struct {
@@ -161,11 +165,28 @@ func parse(c *caddy.Controller) (*SpeedCheck, error) {
 		}
 	}
 
+	cfg.wildcardOverrides, cfg.hasWildcardRules = buildWildcardOverrides(cfg.hostOverrides)
+
 	return &SpeedCheck{
 		cfg:    cfg,
 		prober: newDefaultProber(cfg.timeout, cfg.parallelChecks, cfg.httpSend, cfg.httpAliveClasses),
 		cache:  newIPCache(cfg.cacheTTL),
 	}, nil
+}
+
+// buildWildcardOverrides indexes "*.example.com" rules by "example.com".
+func buildWildcardOverrides(overrides map[string]hostOverride) (map[string]hostOverride, bool) {
+	var wildcard map[string]hostOverride
+	for host, ov := range overrides {
+		if !strings.HasPrefix(host, "*.") {
+			continue
+		}
+		if wildcard == nil {
+			wildcard = make(map[string]hostOverride, len(overrides))
+		}
+		wildcard[host[2:]] = ov
+	}
+	return wildcard, wildcard != nil
 }
 
 func parseSpeedCheckMode(args []string) ([]checkSpec, bool, error) {

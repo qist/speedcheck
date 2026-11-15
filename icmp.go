@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
@@ -14,53 +14,179 @@ import (
 )
 
 // --- ICMP engine (all platforms) ---
-// Uses golang.org/x/net/icmp with per-ping sockets.
-// No raw socket / CAP_NET_RAW required.
+// Uses golang.org/x/net/icmp with one shared socket per address family.
+// A single reader goroutine demultiplexes echo replies by (ID, Seq), so a
+// probe costs one send + one channel wait instead of a socket create/close
+// pair plus an extra goroutine. Raw sockets still require CAP_NET_RAW.
 
 var icmpIDSeq atomic.Uint32
 
-// icmpBufPool reuses 1500-byte buffers to avoid per-ping allocation.
-var icmpBufPool = sync.Pool{
-	New: func() any { b := make([]byte, 1500); return &b },
-}
-
 // icmpEchoData is the constant payload sent in every echo request.
 var icmpEchoData = []byte("coredns-speedcheck")
+
+type pingKey struct {
+	id  int
+	seq int
+}
+
+// icmpFamily owns the shared socket for one address family.
+type icmpFamily struct {
+	isV4 bool
+
+	mu      sync.Mutex
+	conn    *icmp.PacketConn
+	err     error // sticky error for permanently unusable sockets (e.g. no CAP_NET_RAW)
+	waiters map[pingKey]chan struct{}
+}
+
+var icmpEngine = [2]icmpFamily{
+	{isV4: true},
+	{isV4: false},
+}
+
+func pingFamily(isV4 bool) *icmpFamily {
+	if isV4 {
+		return &icmpEngine[0]
+	}
+	return &icmpEngine[1]
+}
+
+func (f *icmpFamily) echoType() icmp.Type {
+	if f.isV4 {
+		return ipv4.ICMPTypeEcho
+	}
+	return ipv6.ICMPTypeEchoRequest
+}
+
+func (f *icmpFamily) replyType() icmp.Type {
+	if f.isV4 {
+		return ipv4.ICMPTypeEchoReply
+	}
+	return ipv6.ICMPTypeEchoReply
+}
+
+// socket returns the shared socket, opening it on first use.
+func (f *icmpFamily) socket() (*icmp.PacketConn, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.conn != nil {
+		return f.conn, nil
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+
+	network := "ip6:ipv6-icmp"
+	if f.isV4 {
+		network = "ip4:icmp"
+	}
+	c, err := icmp.ListenPacket(network, "")
+	if err != nil {
+		// Permission errors never heal; anything else (e.g. EMFILE) may.
+		if errors.Is(err, os.ErrPermission) {
+			f.err = err
+		}
+		return nil, err
+	}
+
+	if f.waiters == nil {
+		f.waiters = make(map[pingKey]chan struct{}, 16)
+	}
+	f.conn = c
+	go f.readLoop(c)
+	return c, nil
+}
+
+// drop forgets the cached socket after a read error, so the next ping reopens it.
+func (f *icmpFamily) drop(c *icmp.PacketConn) {
+	f.mu.Lock()
+	if f.conn == c {
+		f.conn = nil
+	}
+	f.mu.Unlock()
+	_ = c.Close()
+}
+
+func (f *icmpFamily) readLoop(c *icmp.PacketConn) {
+	defer f.drop(c)
+
+	buf := make([]byte, 1500)
+	proto := icmpProtocol(f.isV4)
+	want := f.replyType()
+
+	for {
+		n, _, err := c.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		rm, err := icmp.ParseMessage(proto, buf[:n])
+		if err != nil || rm.Type != want {
+			continue
+		}
+		body, ok := rm.Body.(*icmp.Echo)
+		if !ok {
+			continue
+		}
+
+		k := pingKey{id: body.ID, seq: body.Seq}
+		f.mu.Lock()
+		ch, ok := f.waiters[k]
+		f.mu.Unlock()
+		if !ok {
+			continue
+		}
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (f *icmpFamily) register(k pingKey) chan struct{} {
+	ch := make(chan struct{}, 1)
+	f.mu.Lock()
+	if f.waiters == nil {
+		f.waiters = make(map[pingKey]chan struct{}, 16)
+	}
+	f.waiters[k] = ch
+	f.mu.Unlock()
+	return ch
+}
+
+func (f *icmpFamily) unregister(k pingKey) {
+	f.mu.Lock()
+	delete(f.waiters, k)
+	f.mu.Unlock()
+}
 
 func pingOnce(ctx context.Context, ip net.IP) error {
 	if ip == nil {
 		return errors.New("nil ip")
 	}
-
-	isV4 := ip.To4() != nil
-	var network string
-	var echoType, replyType icmp.Type
-	if isV4 {
-		network = "ip4:icmp"
-		echoType = ipv4.ICMPTypeEcho
-		replyType = ipv4.ICMPTypeEchoReply
-	} else {
-		network = "ip6:ipv6-icmp"
-		echoType = ipv6.ICMPTypeEchoRequest
-		replyType = ipv6.ICMPTypeEchoReply
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
-	c, err := icmp.ListenPacket(network, "")
+	isV4 := ip.To4() != nil
+	f := pingFamily(isV4)
+
+	c, err := f.socket()
 	if err != nil {
 		return err
 	}
-	defer c.Close()
 
 	idSeq := icmpIDSeq.Add(1)
-	id := int(idSeq & 0xffff)
-	seq := int((idSeq >> 16) & 0xffff)
+	k := pingKey{id: int(idSeq & 0xffff), seq: int((idSeq >> 16) & 0xffff)}
+	ch := f.register(k)
+	defer f.unregister(k)
 
 	msg := icmp.Message{
-		Type: echoType,
+		Type: f.echoType(),
 		Code: 0,
 		Body: &icmp.Echo{
-			ID:   id,
-			Seq:  seq,
+			ID:   k.id,
+			Seq:  k.seq,
 			Data: icmpEchoData,
 		},
 	}
@@ -68,53 +194,29 @@ func pingOnce(ctx context.Context, ip net.IP) error {
 	if err != nil {
 		return err
 	}
-
-	dst := &net.IPAddr{IP: ip}
-	if _, err := c.WriteTo(b, dst); err != nil {
+	if _, err := c.WriteTo(b, &net.IPAddr{IP: ip}); err != nil {
 		return err
 	}
 
-	if dl, ok := ctx.Deadline(); ok {
-		_ = c.SetReadDeadline(dl)
-	}
-
-	// Start a goroutine to interrupt ReadFrom when the context is cancelled.
-	// This is needed because icmp.PacketConn doesn't respect context.
-	bufPtr := icmpBufPool.Get().(*[]byte)
-	defer icmpBufPool.Put(bufPtr)
-	buf := *bufPtr
-
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = c.SetReadDeadline(time.Now())
-		case <-done:
-		}
-	}()
-	defer close(done)
-
-	for {
-		n, peer, err := c.ReadFrom(buf)
-		if err != nil {
-			return err
-		}
-		_ = peer
-		rm, err := icmp.ParseMessage(icmpProtocol(isV4), buf[:n])
-		if err != nil {
-			continue
-		}
-		if rm.Type != replyType {
-			continue
-		}
-		body, ok := rm.Body.(*icmp.Echo)
-		if !ok {
-			continue
-		}
-		if body.ID != id || body.Seq != seq {
-			continue
-		}
+	select {
+	case <-ch:
 		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// closeICMPEngine closes the shared sockets; in-flight pings fail on cancel.
+func closeICMPEngine() {
+	for i := range icmpEngine {
+		f := &icmpEngine[i]
+		f.mu.Lock()
+		c := f.conn
+		f.conn = nil
+		f.mu.Unlock()
+		if c != nil {
+			_ = c.Close()
+		}
 	}
 }
 

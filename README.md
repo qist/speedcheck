@@ -82,7 +82,7 @@ v4/v6 并发竞速模式（`off` / `on` / `winner`），默认 `off`。
 
 `winner` 模式行为：
 - TypeA 查询：与 `on` 相同，只测速 A 记录
-- TypeAAAA 查询：收集 AAAA + 向上游请求 A，合并竞速；v6 赢返回最快 AAAA，v4 赢返回 NOERROR + 非 AAAA 记录（CNAME 等）
+- TypeAAAA 查询：A 查询与 AAAA 查询并行发起，收集两边 IP 合并竞速；v6 赢返回最快 AAAA，v4 赢返回 NOERROR + 非 AAAA 记录（CNAME 等）
 - 全部不通：回落到匹配查询类型的首个 IP
 
 不通的 IP 处理：探测失败的 IP 直接跳过。`on` 模式仅测速同家族；`winner` 模式对 AAAA 查询做跨家族竞速。
@@ -251,9 +251,11 @@ HTTP 探测可接受的状态码分类，可多选：
 
 - ICMP ping 需要 `CAP_NET_RAW` 权限或 root 权限；缺少权限时 ping 探测会静默失败，不影响其他探测模式
 - `http:443` 探测会并发尝试 HTTPS/1.x 和 HTTP/3（QUIC），取先成功的结果
-- 探测连接不复用，每次探测都是新建连接，以准确测量连接建立延迟
+- 探测连接不复用，每次探测都是新建连接，以准确测量连接建立延迟（HTTP/HTTPS 探测启用 TCP Fast Open，裸 TCP 连通性探测不启用，否则测到的不是握手时延）
 - 缓存按 `域名+查询类型` 存储，过期条目在访问时自动清理
 - 探测并发上限为 32 个 IP；超出时排队等待，防止协程爆炸
+- ICMP 按协议族各复用一个 socket，通过 `(ID, Seq)` 分发应答，不再为每次 ping 创建 socket
+- 同一域名的并发查询共享一次测速，避免热门域名在缓存关闭时放大探测数量
 
 ## Download
 

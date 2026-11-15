@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"reflect"
 	"strconv"
@@ -19,49 +20,66 @@ import (
 	"github.com/quic-go/quic-go/http3"
 )
 
-var defaultDialer = net.Dialer{
-	Control: tcpFastOpenControl,
-}
+// defaultDialer is used by bare TCP connect probes. It must not use
+// TCP_FASTOPEN_CONNECT: that option makes connect(2) return before the
+// handshake completes, so every IP — including unreachable ones — would look
+// instantly reachable and the race would pick an arbitrary IP.
+var defaultDialer = net.Dialer{}
 
-var baseTLSConfig = &tls.Config{InsecureSkipVerify: true}
+// tfoDialer is used by the HTTP/TLS probes, which write a request right after
+// connecting, so TFO actually saves a round trip there.
+var tfoDialer = net.Dialer{Control: tcpFastOpenControl}
+
+var baseTLSConfig = &tls.Config{
+	InsecureSkipVerify: true,
+	// Probes to the same host repeat across queries; resumption skips the
+	// asymmetric handshake when the backend still has a valid ticket.
+	ClientSessionCache: tls.NewLRUClientSessionCache(64),
+}
 
 // bufioReaderPool reuses bufio.Reader objects to avoid per-probe allocation.
 var bufioReaderPool = sync.Pool{
 	New: func() any { return bufio.NewReaderSize(nil, 4096) },
 }
 
-// httpSendCache caches the rendered HTTP request bytes per host to avoid
-// repeated string replacements on every probe.
+// httpSendCache caches the rendered HTTP request bytes per template+host to
+// avoid repeated string replacement on every probe. host must be sanitized.
+type httpSendKey struct {
+	template string
+	host     string
+}
+
 var (
 	httpSendCacheMu sync.RWMutex
-	httpSendCache   = make(map[string][]byte, 64)
+	httpSendCache   = make(map[httpSendKey][]byte, 64)
 )
 
-func httpSendBytesCached(httpSend []byte, host string) []byte {
-	host = sanitizeHost(host)
+const httpSendCacheMax = 256
 
-	// Check cache first
+func httpSendBytesCached(tpl, host string) []byte {
+	k := httpSendKey{template: tpl, host: host}
+
 	httpSendCacheMu.RLock()
-	if cached, ok := httpSendCache[host]; ok {
-		httpSendCacheMu.RUnlock()
+	cached, ok := httpSendCache[k]
+	httpSendCacheMu.RUnlock()
+	if ok {
 		return cached
 	}
-	httpSendCacheMu.RUnlock()
 
-	// Build and cache
 	var result []byte
-	if len(httpSend) == 0 {
+	if tpl == "" {
 		result = []byte("GET / HTTP/1.0\r\n\r\n")
 	} else {
-		s := strings.ReplaceAll(string(httpSend), "{host}", host)
+		s := strings.ReplaceAll(tpl, "{host}", host)
 		s = strings.ReplaceAll(s, "{HOST}", host)
 		result = []byte(s)
 	}
 
 	httpSendCacheMu.Lock()
-	if len(httpSendCache) < 256 {
-		httpSendCache[host] = result
+	if len(httpSendCache) >= httpSendCacheMax {
+		httpSendCache = make(map[httpSendKey][]byte, 64)
 	}
+	httpSendCache[k] = result
 	httpSendCacheMu.Unlock()
 
 	return result
@@ -72,24 +90,25 @@ func httpSendBytesCached(httpSend []byte, host string) []byte {
 const h3TransportTTL = 5 * time.Minute
 
 var (
-	h3TransportPool  sync.Map // key: host(string) -> *h3TransportEntry
-	h3CleanupOnce    sync.Once
-	h3CleanupStopCh  = make(chan struct{})
+	h3TransportPool sync.Map // key: host(string) -> *h3TransportEntry
+	h3CleanupOnce   sync.Once
+	h3CleanupStopCh = make(chan struct{})
 )
 
 type h3TransportEntry struct {
 	tr      *http3.Transport
+	client  *http.Client
 	tlsCfg  *tls.Config
 	created time.Time
 }
 
-func getH3Transport(host string) *http3.Transport {
+func getH3Transport(host string) *h3TransportEntry {
 	h3CleanupOnce.Do(startH3Cleanup)
 
 	if v, ok := h3TransportPool.Load(host); ok {
 		entry := v.(*h3TransportEntry)
 		if time.Since(entry.created) < h3TransportTTL {
-			return entry.tr
+			return entry
 		}
 		h3TransportPool.Delete(host)
 		go entry.tr.Close()
@@ -100,13 +119,23 @@ func getH3Transport(host string) *http3.Transport {
 	tr := &http3.Transport{
 		TLSClientConfig: tlsCfg,
 	}
-	entry := &h3TransportEntry{tr: tr, tlsCfg: tlsCfg, created: time.Now()}
+	entry := &h3TransportEntry{
+		tr: tr,
+		client: &http.Client{
+			Transport: tr,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		tlsCfg:  tlsCfg,
+		created: time.Now(),
+	}
 	actual, _ := h3TransportPool.LoadOrStore(host, entry)
 	actualEntry := actual.(*h3TransportEntry)
 	if actualEntry != entry {
 		tr.Close()
 	}
-	return actualEntry.tr
+	return actualEntry
 }
 
 func startH3Cleanup() {
@@ -153,7 +182,7 @@ type prober struct {
 	timeout          time.Duration
 	parallelChecks   bool
 	maxConcurrency   int
-	httpSend         []byte
+	httpSendTpl      string
 	httpAliveClasses map[httpAliveClass]struct{}
 	pingFn           func(ctx context.Context, ip net.IP) error
 }
@@ -172,7 +201,7 @@ func newDefaultProber(timeout time.Duration, parallelChecks bool, httpSend []byt
 		timeout:          timeout,
 		parallelChecks:   parallelChecks,
 		maxConcurrency:   32,
-		httpSend:         httpSend,
+		httpSendTpl:      string(httpSend),
 		httpAliveClasses: cp,
 		pingFn:           pingOnce,
 	}
@@ -262,9 +291,9 @@ func (p *prober) pickBest(ctx context.Context, host string, pref ipPreference, i
 		return nil, false
 	}
 
-	probeCtx, cancel := context.WithCancel(ctx)
-	timer := time.AfterFunc(p.timeout, cancel)
-	defer timer.Stop()
+	// WithTimeout (rather than AfterFunc) propagates the deadline, so the
+	// per-IP probes can reuse it instead of arming a timer each.
+	probeCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
 	type outcome struct {
@@ -386,9 +415,7 @@ func (p *prober) pickBestBoth(ctx context.Context, host string, ips []net.IP, ch
 		return nil, nil
 	}
 
-	probeCtx, cancel := context.WithCancel(ctx)
-	timer := time.AfterFunc(p.timeout, cancel)
-	defer timer.Stop()
+	probeCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
 	type outcome struct {
@@ -485,23 +512,37 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 	if parentCtx == nil {
 		parentCtx = context.Background()
 	}
-	probeCtx, cancel := context.WithCancel(parentCtx)
-	timer := time.AfterFunc(p.timeout, cancel)
-	defer timer.Stop()
+	// The caller normally already bounded this batch with a deadline; reuse it
+	// so racing N IPs does not arm N timers. The deadline also has to exist,
+	// because the HTTP probe relies on it for its socket read deadline.
+	var probeCtx context.Context
+	var cancel context.CancelFunc
+	if _, ok := parentCtx.Deadline(); ok {
+		probeCtx, cancel = context.WithCancel(parentCtx)
+	} else {
+		probeCtx, cancel = context.WithTimeout(parentCtx, p.timeout)
+	}
 	defer cancel()
 
 	var (
 		pingSeen bool
 		pingOK   bool
 		pingDur  time.Duration
-		others   []checkSpec
 	)
 	for _, c := range checks {
 		if c.kind == checkPing {
 			pingSeen = true
-			continue
+			break
 		}
-		others = append(others, c)
+	}
+	others := checks
+	if pingSeen {
+		others = make([]checkSpec, 0, len(checks)-1)
+		for _, c := range checks {
+			if c.kind != checkPing {
+				others = append(others, c)
+			}
+		}
 	}
 
 	if speedcheckDebug {
@@ -510,12 +551,10 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 
 	if pingSeen && (!p.parallelChecks || len(others) == 0) {
 		start := time.Now()
-		ctxPing, cancelPing := context.WithTimeout(probeCtx, p.timeout)
-		if err := p.pingFn(ctxPing, ip); err == nil {
+		if err := p.pingFn(probeCtx, ip); err == nil {
 			pingOK = true
 			pingDur = time.Since(start)
 		}
-		cancelPing()
 	}
 
 	if len(others) == 0 {
@@ -536,12 +575,10 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 		if pingSeen {
 			go func() {
 				start := time.Now()
-				ctxPing, cancelPing := context.WithTimeout(ctx2, p.timeout)
-				err := p.pingFn(ctxPing, ip)
-				cancelPing()
+				err := p.pingFn(ctx2, ip)
 				d := time.Since(start)
 				if speedcheckDebug && shouldLogProbeErr(err) {
-					speedcheckDebugf("check host=%s ip=%s kind=%s ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(checkPing), err == nil, d, ctxLeft(ctxPing), err, errDetails(err))
+					speedcheckDebugf("check host=%s ip=%s kind=%s ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(checkPing), err == nil, d, ctxLeft(ctx2), err, errDetails(err))
 				}
 				resultCh <- probeResult{kind: checkPing, d: d, ok: err == nil, err: err}
 			}()
@@ -549,21 +586,21 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 		for _, c := range others {
 			c := c
 			go func() {
-				ctxCheck, cancelCheck := context.WithTimeout(ctx2, p.timeout)
-				defer cancelCheck()
+				// ctx2 already carries the batch deadline and is cancelled as
+				// soon as any check succeeds; no per-check timer is needed.
 				switch c.kind {
 				case checkTCP:
 					start := time.Now()
-					err := tcpConnect(ctxCheck, ip, c.port)
+					err := tcpConnect(ctx2, ip, c.port)
 					d := time.Since(start)
 					if speedcheckDebug && shouldLogProbeErr(err) {
-						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, ctxLeft(ctxCheck), err, errDetails(err))
+						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, ctxLeft(ctx2), err, errDetails(err))
 					}
 					resultCh <- probeResult{kind: c.kind, port: c.port, d: d, ok: err == nil, err: err}
 				case checkHTTP:
-					d, err := p.httpProbe(ctxCheck, ip, c.port, host)
+					d, err := p.httpProbe(ctx2, ip, c.port, host)
 					if speedcheckDebug && shouldLogProbeErr(err) {
-						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, ctxLeft(ctxCheck), err, errDetails(err))
+						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v errDetail=%s", host, ip.String(), checkKindName(c.kind), c.port, err == nil, d, ctxLeft(ctx2), err, errDetails(err))
 					}
 					resultCh <- probeResult{kind: c.kind, port: c.port, d: d, ok: err == nil, err: err}
 				default:
@@ -605,8 +642,10 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 			}
 		}
 	} else {
+		// probeCtx already carries the batch deadline, so the checks can share
+		// it instead of allocating a context (and a timer) per check.
+		ctxCheck := probeCtx
 		for _, c := range others {
-			ctxCheck, cancelCheck := context.WithTimeout(probeCtx, p.timeout)
 			switch c.kind {
 			case checkTCP:
 				start := time.Now()
@@ -614,13 +653,11 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 					if speedcheckDebug {
 						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, true, time.Since(start), ctxLeft(ctxCheck), nil)
 					}
-					cancelCheck()
 					if pingOK {
 						return pingDur, true
 					}
 					return time.Since(start), true
 				} else if errors.Is(err, context.Canceled) {
-					cancelCheck()
 					if pingOK {
 						return pingDur, true
 					}
@@ -636,13 +673,11 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 					if speedcheckDebug {
 						speedcheckDebugf("check host=%s ip=%s kind=%s port=%d ok=%t dur=%s left=%s err=%v", host, ip.String(), checkKindName(c.kind), c.port, true, d, ctxLeft(ctxCheck), nil)
 					}
-					cancelCheck()
 					if pingOK {
 						return pingDur, true
 					}
 					return d, true
 				} else if errors.Is(err, context.Canceled) {
-					cancelCheck()
 					if pingOK {
 						return pingDur, true
 					}
@@ -653,10 +688,8 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 					}
 				}
 			default:
-				cancelCheck()
 				return 0, false
 			}
-			cancelCheck()
 		}
 	}
 
@@ -667,7 +700,7 @@ func (p *prober) probeIP(ctx context.Context, ip net.IP, host string, checks []c
 }
 
 func tcpConnect(ctx context.Context, ip net.IP, port uint16) error {
-	conn, err := defaultDialer.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(int(port))))
+	conn, err := defaultDialer.DialContext(ctx, "tcp", ipPortString(ip, port))
 	if err != nil {
 		return err
 	}
@@ -677,6 +710,25 @@ func tcpConnect(ctx context.Context, ip net.IP, port uint16) error {
 	}
 	_ = conn.Close()
 	return nil
+}
+
+// ipPortString builds "ip:port" with a single allocation (the string itself)
+// instead of ip.String() + strconv.Itoa + JoinHostPort.
+func ipPortString(ip net.IP, port uint16) string {
+	var buf [64]byte
+	b := buf[:0]
+	if v4 := ip.To4(); v4 != nil {
+		b = netip.AddrFrom4([4]byte{v4[0], v4[1], v4[2], v4[3]}).AppendTo(b)
+	} else if addr, ok := netip.AddrFromSlice(ip); ok {
+		b = append(b, '[')
+		b = addr.AppendTo(b)
+		b = append(b, ']')
+	} else {
+		return ""
+	}
+	b = append(b, ':')
+	b = strconv.AppendUint(b, uint64(port), 10)
+	return string(b)
 }
 
 func setLinger0(conn net.Conn) {
@@ -690,7 +742,6 @@ func setLinger0(conn net.Conn) {
 	_ = tc.SetLinger(0)
 }
 
-
 func sanitizeHost(host string) string {
 	host = strings.ReplaceAll(host, "\r", "")
 	host = strings.ReplaceAll(host, "\n", "")
@@ -700,7 +751,7 @@ func sanitizeHost(host string) string {
 // httpSendBytes is retained for backward compatibility but now delegates
 // to the cached version.
 func httpSendBytes(httpSend []byte, host string) []byte {
-	return httpSendBytesCached(httpSend, host)
+	return httpSendBytesCached(string(httpSend), sanitizeHost(host))
 }
 
 func redirectLocationIPFamilyMismatch(location string, probedIP net.IP) bool {
@@ -794,7 +845,8 @@ func (p *prober) http1Probe(ctx context.Context, ip net.IP, port uint16, host st
 	start := time.Now()
 	host = sanitizeHost(host)
 	addr := net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))
-	rawConn, err := defaultDialer.DialContext(ctx, "tcp", addr)
+	// Data is written immediately after connecting, so TFO saves a round trip.
+	rawConn, err := tfoDialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return 0, err
 	}
@@ -805,7 +857,9 @@ func (p *prober) http1Probe(ctx context.Context, ip net.IP, port uint16, host st
 	if tlsEnabled {
 		tlsCfg := baseTLSConfig.Clone()
 		tlsCfg.ServerName = host
-		tlsCfg.NextProtos = []string{"h2", "http/1.1"}
+		// This probe speaks HTTP/1.1 by hand; advertising h2 would make the
+		// server expect a binary frame stream and fail the request.
+		tlsCfg.NextProtos = []string{"http/1.1"}
 		tlsConn := tls.Client(rawConn, tlsCfg)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			return 0, err
@@ -817,7 +871,7 @@ func (p *prober) http1Probe(ctx context.Context, ip net.IP, port uint16, host st
 		_ = conn.SetDeadline(dl)
 	}
 
-	req := httpSendBytesCached(p.httpSend, host)
+	req := httpSendBytesCached(p.httpSendTpl, host)
 	if _, err := conn.Write(req); err != nil {
 		return 0, err
 	}
@@ -857,14 +911,7 @@ func (p *prober) http3Probe(ctx context.Context, ip net.IP, port uint16, host st
 	}
 	url := "https://" + authority + "/"
 
-	tr := getH3Transport(host)
-
-	client := &http.Client{
-		Transport: tr,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	entry := getH3Transport(host)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
 	if err != nil {
@@ -872,7 +919,7 @@ func (p *prober) http3Probe(ctx context.Context, ip net.IP, port uint16, host st
 	}
 	req.Host = host
 
-	resp, err := client.Do(req)
+	resp, err := entry.client.Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -888,13 +935,26 @@ func (p *prober) http3Probe(ctx context.Context, ip net.IP, port uint16, host st
 }
 
 func parseHTTPStatus(statusLine string) (int, error) {
-	parts := strings.Fields(statusLine)
-	if len(parts) < 2 {
-		return 0, fmt.Errorf("invalid http status line")
+	// Status line is "HTTP/1.1 200 OK"; parse it in place to avoid the
+	// strings.Fields allocation on every probe.
+	i := 0
+	for i < len(statusLine) && statusLine[i] != ' ' {
+		i++
 	}
-	code, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return 0, err
+	for i < len(statusLine) && statusLine[i] == ' ' {
+		i++
+	}
+	code, n := 0, 0
+	for i+n < len(statusLine) {
+		c := statusLine[i+n]
+		if c < '0' || c > '9' {
+			break
+		}
+		code = code*10 + int(c-'0')
+		n++
+	}
+	if n == 0 {
+		return 0, fmt.Errorf("invalid http status line")
 	}
 	return code, nil
 }

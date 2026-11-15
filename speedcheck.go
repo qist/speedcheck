@@ -22,6 +22,7 @@ type SpeedCheck struct {
 
 	prober ipPicker
 	cache  *ipCache
+	probes probeGroup
 }
 
 func (s *SpeedCheck) Name() string { return pluginName }
@@ -30,7 +31,60 @@ func (s *SpeedCheck) OnShutdown() {
 	if s.cache != nil {
 		s.cache.Close()
 	}
+	closeICMPEngine()
 	stopH3Cleanup()
+}
+
+// probeGroup collapses concurrent probes for the same host/family into a
+// single race, so a burst of identical queries does not multiply the number
+// of outbound connections. Zero value is ready to use.
+type probeGroup struct {
+	mu sync.Mutex
+	m  map[probeKey]*probeCall
+}
+
+// probeKey is a comparable key: no per-query string concatenation.
+type probeKey struct {
+	host  string
+	qtype uint16
+	pref  ipPreference
+}
+
+type probeCall struct {
+	done chan struct{}
+	ip   net.IP
+	ok   bool
+}
+
+func (g *probeGroup) do(ctx context.Context, key probeKey, fn func() (net.IP, bool)) (net.IP, bool) {
+	g.mu.Lock()
+	if c, ok := g.m[key]; ok {
+		g.mu.Unlock()
+		select {
+		case <-c.done:
+			return c.ip, c.ok
+		case <-ctx.Done():
+			// The caller went away; do not pin it to the shared race.
+			return nil, false
+		}
+	}
+	if g.m == nil {
+		g.m = make(map[probeKey]*probeCall, 16)
+	}
+	c := &probeCall{done: make(chan struct{})}
+	g.m[key] = c
+	g.mu.Unlock()
+
+	// Release waiters even if the probe panics.
+	defer func() {
+		g.mu.Lock()
+		delete(g.m, key)
+		g.mu.Unlock()
+		close(c.done)
+	}()
+
+	c.ip, c.ok = fn()
+	return c.ip, c.ok
 }
 
 var speedcheckDebug = os.Getenv("SPEEDCHECK_DEBUG") != ""
@@ -170,22 +224,6 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 
 	speedcheckDebugf("query name=%s qtype=%d parallelChecks=%t ipParallelMode=%d ipPref=%d timeout=%s", q.Name, q.Qtype, s.cfg.parallelChecks, s.cfg.ipParallelMode, s.cfg.ipPref, s.cfg.timeout)
 
-	cw := newCaptureWriter(w)
-	rcode, err := plugin.NextOrFailure(s.Name(), s.Next, ctx, cw, r)
-	if cw.Msg == nil {
-		speedcheckDebugf("upstream no message name=%s qtype=%d rcode=%d err=%v", q.Name, q.Qtype, rcode, err)
-		return rcode, err
-	}
-
-	msg := cw.Msg.Copy()
-	if msg.Rcode != dns.RcodeSuccess {
-		speedcheckDebugf("upstream non-success name=%s qtype=%d rcode=%d", q.Name, q.Qtype, msg.Rcode)
-		state := request.Request{W: w, Req: r}
-		state.SizeAndDo(msg)
-		_ = w.WriteMsg(msg)
-		return msg.Rcode, err
-	}
-
 	host := strings.TrimSuffix(q.Name, ".")
 	override, hasOverride := s.findOverride(strings.ToLower(host))
 
@@ -202,6 +240,33 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 		pref = override.ipPref
 		ipParMode = ipParallelOff
 		allowOther = override.allowOther
+	}
+
+	// "winner" mode needs the A answer on top of the AAAA one. Start that
+	// upstream query before the main one, so the two overlap instead of the A
+	// query costing a full extra round trip after the AAAA answer has arrived.
+	var prefetchA *aPrefetch
+	if ipParMode == ipParallelWinner && q.Qtype == dns.TypeAAAA {
+		prefetchA = s.startPrefetchA(ctx, w, r)
+		defer prefetchA.cancel()
+	}
+
+	cw := newCaptureWriter(w)
+	defer releaseCaptureWriter(cw)
+	rcode, err := plugin.NextOrFailure(s.Name(), s.Next, ctx, cw, r)
+	if cw.Msg == nil {
+		speedcheckDebugf("upstream no message name=%s qtype=%d rcode=%d err=%v", q.Name, q.Qtype, rcode, err)
+		return rcode, err
+	}
+
+	// Shallow copy: only the header changes below (Answer is replaced with a
+	// new slice), the RRs themselves are never mutated, and the next plugin may
+	// still hold its own reference to cw.Msg.
+	msg := *cw.Msg
+	if msg.Rcode != dns.RcodeSuccess {
+		speedcheckDebugf("upstream non-success name=%s qtype=%d rcode=%d", q.Name, q.Qtype, msg.Rcode)
+		s.writeMsg(w, r, &msg)
+		return msg.Rcode, err
 	}
 
 	if hasOverride && !override.enabled {
@@ -225,9 +290,7 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 				msg.Answer = s.dropA(msg.Answer)
 			}
 		}
-		state := request.Request{W: w, Req: r}
-		state.SizeAndDo(msg)
-		_ = w.WriteMsg(msg)
+		s.writeMsg(w, r, &msg)
 		return msg.Rcode, err
 	}
 
@@ -238,34 +301,26 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 					if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeA, s.fetchUpstreamAnswer(ctx, w, r, dns.TypeA), checks, ipPrefV4First, ipParallelOff); ok {
 						speedcheckDebugf("host override prefer ipv4 (v4 ok), return empty AAAA host=%s", host)
 						msg.Answer = s.dropAAAA(msg.Answer)
-						state := request.Request{W: w, Req: r}
-						state.SizeAndDo(msg)
-						_ = w.WriteMsg(msg)
+						s.writeMsg(w, r, &msg)
 						return msg.Rcode, err
 					}
 				} else {
 					speedcheckDebugf("host override force ipv4, return empty AAAA host=%s", host)
 					msg.Answer = s.dropAAAA(msg.Answer)
-					state := request.Request{W: w, Req: r}
-					state.SizeAndDo(msg)
-					_ = w.WriteMsg(msg)
+					s.writeMsg(w, r, &msg)
 					return msg.Rcode, err
 				}
 			} else {
 				if selected := s.selectFastestWith(ctx, host, dns.TypeAAAA, msg.Answer, checks, ipPrefV6First, ipParallelOff); selected != nil {
 					msg.Answer = selected
-					state := request.Request{W: w, Req: r}
-					state.SizeAndDo(msg)
-					_ = w.WriteMsg(msg)
+					s.writeMsg(w, r, &msg)
 					return msg.Rcode, err
 				}
 				if allowOther {
 					if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeA, s.fetchUpstreamAnswer(ctx, w, r, dns.TypeA), checks, ipPrefV4First, ipParallelOff); ok {
 						speedcheckDebugf("host override prefer ipv6 but v6 failed, use ipv4 fallback host=%s", host)
 						msg.Answer = s.dropAAAA(msg.Answer)
-						state := request.Request{W: w, Req: r}
-						state.SizeAndDo(msg)
-						_ = w.WriteMsg(msg)
+						s.writeMsg(w, r, &msg)
 						return msg.Rcode, err
 					}
 				}
@@ -276,17 +331,13 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 					if _, ok := s.selectFastestStrictWith(ctx, host, dns.TypeAAAA, s.fetchUpstreamAnswer(ctx, w, r, dns.TypeAAAA), checks, ipPrefV6First, ipParallelOff); ok {
 						speedcheckDebugf("host override prefer ipv6 (v6 ok), return empty A host=%s", host)
 						msg.Answer = s.dropA(msg.Answer)
-						state := request.Request{W: w, Req: r}
-						state.SizeAndDo(msg)
-						_ = w.WriteMsg(msg)
+						s.writeMsg(w, r, &msg)
 						return msg.Rcode, err
 					}
 				} else {
 					speedcheckDebugf("host override force ipv6, return empty A host=%s", host)
 					msg.Answer = s.dropA(msg.Answer)
-					state := request.Request{W: w, Req: r}
-					state.SizeAndDo(msg)
-					_ = w.WriteMsg(msg)
+					s.writeMsg(w, r, &msg)
 					return msg.Rcode, err
 				}
 			} else {
@@ -294,9 +345,7 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 					if _, ok2 := s.selectFastestStrictWith(ctx, host, dns.TypeAAAA, s.fetchUpstreamAnswer(ctx, w, r, dns.TypeAAAA), checks, ipPrefV6First, ipParallelOff); ok2 {
 						speedcheckDebugf("host override prefer ipv4 but v4 failed, use ipv6 fallback host=%s", host)
 						msg.Answer = s.dropA(msg.Answer)
-						state := request.Request{W: w, Req: r}
-						state.SizeAndDo(msg)
-						_ = w.WriteMsg(msg)
+						s.writeMsg(w, r, &msg)
 						return msg.Rcode, err
 					}
 				}
@@ -306,16 +355,22 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 	// "winner" mode: cross-family race for AAAA queries (original pickBestAcrossFamilies logic).
 	// A queries and "on"/"off" modes race within the requested family only.
 	if ipParMode == ipParallelWinner && q.Qtype == dns.TypeAAAA {
-		if ip, ok := s.pickBestAcrossFamilies(ctx, host, msg.Answer, r, w); ok {
+		// The A records are only needed when the answer actually carries AAAA
+		// candidates, so wait for the prefetch lazily.
+		fetchA := func() []dns.RR { return prefetchA.wait(ctx) }
+		if ip, ok := s.pickBestAcrossFamilies(ctx, host, msg.Answer, fetchA); ok {
 			speedcheckDebugf("winner-race winner host=%s ip=%s", host, ip.String())
 			if ip.To4() != nil {
 				// v4 won — drop AAAA, return NOERROR with non-AAAA records (CNAME etc).
 				speedcheckDebugf("winner-race v4 won, dropAAAA host=%s", host)
 				msg.Answer = s.dropAAAA(msg.Answer)
+				// The client will follow up with an A query; the winner came from
+				// that answer, so it can be served straight from cache.
+				s.cache.Set(host, dns.TypeA, ip.String(), time.Now())
 			} else {
-				// v6 won — return the fastest AAAA.
-				selected := s.selectFastestWith(ctx, host, dns.TypeAAAA, msg.Answer, checks, pref, ipParallelOff)
-				if selected != nil {
+				// v6 won — the race already picked it, no second probe pass needed.
+				if selected := answerForIP(msg.Answer, ip, dns.TypeAAAA); selected != nil {
+					s.cache.Set(host, dns.TypeAAAA, ip.String(), time.Now())
 					msg.Answer = selected
 				}
 			}
@@ -328,10 +383,14 @@ func (s *SpeedCheck) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 		}
 	}
 
-	state := request.Request{W: w, Req: r}
+	s.writeMsg(w, r, &msg)
+	return msg.Rcode, err
+}
+
+func (s *SpeedCheck) writeMsg(w dns.ResponseWriter, req, msg *dns.Msg) {
+	state := request.Request{W: w, Req: req}
 	state.SizeAndDo(msg)
 	_ = w.WriteMsg(msg)
-	return msg.Rcode, err
 }
 
 func (s *SpeedCheck) fetchUpstreamAnswer(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, qtype uint16) []dns.RR {
@@ -342,6 +401,7 @@ func (s *SpeedCheck) fetchUpstreamAnswer(ctx context.Context, w dns.ResponseWrit
 	req.Question[0].Qtype = qtype
 
 	cw := newCaptureWriter(w)
+	defer releaseCaptureWriter(cw)
 	ctx2, cancel := context.WithTimeout(ctx, s.cfg.timeout)
 	defer cancel()
 	rcode, _ := plugin.NextOrFailure(s.Name(), s.Next, ctx2, cw, req)
@@ -351,9 +411,48 @@ func (s *SpeedCheck) fetchUpstreamAnswer(ctx context.Context, w dns.ResponseWrit
 	return cw.Msg.Answer
 }
 
+// aPrefetch is an upstream A query started in parallel with the main AAAA
+// query. It is only used by "winner" mode, where both families are raced.
+type aPrefetch struct {
+	ch     chan []dns.RR
+	cancel context.CancelFunc
+}
+
+func (s *SpeedCheck) startPrefetchA(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) *aPrefetch {
+	// Copy before the goroutine starts: the request is read concurrently by the
+	// main query, and the copy gives the prefetch its own question to rewrite.
+	req := r.Copy()
+
+	p := &aPrefetch{ch: make(chan []dns.RR, 1)}
+	ctx2, cancel := context.WithTimeout(ctx, s.cfg.timeout)
+	p.cancel = cancel
+
+	go func() {
+		defer cancel()
+		// Buffered channel: the sender never blocks, even when nobody waits
+		// (answer had no AAAA candidates, or the request was cancelled).
+		p.ch <- s.fetchUpstreamAnswer(ctx2, w, req, dns.TypeA)
+	}()
+	return p
+}
+
+// wait returns the prefetched A records, or nil if the query failed or the
+// caller's context expired first. Safe to call on a nil *aPrefetch.
+func (p *aPrefetch) wait(ctx context.Context) []dns.RR {
+	if p == nil {
+		return nil
+	}
+	select {
+	case ans := <-p.ch:
+		return ans
+	case <-ctx.Done():
+		return nil
+	}
+}
+
 func (s *SpeedCheck) selectFastestStrictWith(ctx context.Context, host string, qtype uint16, answer []dns.RR, checks []checkSpec, pref ipPreference, ipParMode ipParallelMode) ([]dns.RR, bool) {
 	var ips []net.IP
-	var rrByIP = make(map[string][]dns.RR)
+	var cands []addrCand
 	var preserved []dns.RR
 
 	for _, rr := range answer {
@@ -363,19 +462,15 @@ func (s *SpeedCheck) selectFastestStrictWith(ctx context.Context, host string, q
 				preserved = append(preserved, rr)
 				continue
 			}
-			ip := a.A
-			key := ip.String()
-			ips = append(ips, ip)
-			rrByIP[key] = append(rrByIP[key], rr)
+			ips = append(ips, a.A)
+			cands = addCandidate(cands, a.A.String(), rr)
 		case *dns.AAAA:
 			if qtype != dns.TypeAAAA && qtype != dns.TypeANY {
 				preserved = append(preserved, rr)
 				continue
 			}
-			ip := a.AAAA
-			key := ip.String()
-			ips = append(ips, ip)
-			rrByIP[key] = append(rrByIP[key], rr)
+			ips = append(ips, a.AAAA)
+			cands = addCandidate(cands, a.AAAA.String(), rr)
 		default:
 			preserved = append(preserved, rr)
 		}
@@ -400,30 +495,27 @@ func (s *SpeedCheck) selectFastestStrictWith(ctx context.Context, host string, q
 	key := bestIP.String()
 	s.cache.Set(host, qtype, key, time.Now())
 	speedcheckDebugf("pickBest ok host=%s qtype=%d ip=%s", host, qtype, key)
-	return append(preserved, rrByIP[key]...), true
+	rrs, _ := candRRs(cands, key)
+	return append(preserved, rrs...), true
 }
 
 func (s *SpeedCheck) selectFastestWith(ctx context.Context, host string, qtype uint16, answer []dns.RR, checks []checkSpec, pref ipPreference, ipParMode ipParallelMode) []dns.RR {
 	var ips []net.IP
-	var rrByIP = make(map[string][]dns.RR)
+	var cands []addrCand
 	var preserved []dns.RR
 
 	for _, rr := range answer {
 		switch a := rr.(type) {
 		case *dns.A:
 			if qtype == dns.TypeA || qtype == dns.TypeANY {
-				ip := a.A
-				key := ip.String()
-				ips = append(ips, ip)
-				rrByIP[key] = append(rrByIP[key], rr)
+				ips = append(ips, a.A)
+				cands = addCandidate(cands, a.A.String(), rr)
 			}
 			// Mismatched A records (for AAAA query) are dropped, not preserved.
 		case *dns.AAAA:
 			if qtype == dns.TypeAAAA || qtype == dns.TypeANY {
-				ip := a.AAAA
-				key := ip.String()
-				ips = append(ips, ip)
-				rrByIP[key] = append(rrByIP[key], rr)
+				ips = append(ips, a.AAAA)
+				cands = addCandidate(cands, a.AAAA.String(), rr)
 			}
 			// Mismatched AAAA records (for A query) are dropped, not preserved.
 		default:
@@ -437,7 +529,7 @@ func (s *SpeedCheck) selectFastestWith(ctx context.Context, host string, qtype u
 	}
 
 	if ipStr, ok := s.cache.Get(host, qtype, time.Now()); ok {
-		if rrs, ok := rrByIP[ipStr]; ok {
+		if rrs, hit := candRRs(cands, ipStr); hit {
 			speedcheckDebugf("cache hit host=%s qtype=%d ip=%s", host, qtype, ipStr)
 			return append(preserved, rrs...)
 		}
@@ -451,13 +543,31 @@ func (s *SpeedCheck) selectFastestWith(ctx context.Context, host string, qtype u
 	if ipParMode != ipParallelOff {
 		pref = ipPrefNone
 	}
-	bestIP, ok := s.prober.pickBest(ctx, host, pref, ips, checks)
+
+	// Share one race between concurrent queries for the same host/family.
+	groupKey := probeKey{host: host, qtype: qtype, pref: pref}
+	bestIP, ok := s.probes.do(ctx, groupKey, func() (net.IP, bool) {
+		// Detached from the caller's context: the shared race must not be
+		// aborted because one of the waiting clients went away.
+		return s.prober.pickBest(context.WithoutCancel(ctx), host, pref, ips, checks)
+	})
 	if ok {
-		key := bestIP.String()
-		bestRRs := rrByIP[key]
-		s.cache.Set(host, qtype, key, time.Now())
-		speedcheckDebugf("pickBest ok host=%s qtype=%d ip=%s", host, qtype, key)
-		return append(preserved, bestRRs...)
+		if bestRRs, hit := candRRs(cands, bestIP.String()); hit {
+			key := bestIP.String()
+			s.cache.Set(host, qtype, key, time.Now())
+			speedcheckDebugf("pickBest ok host=%s qtype=%d ip=%s", host, qtype, key)
+			return append(preserved, bestRRs...)
+		}
+		// The shared race answered with an IP this answer no longer contains
+		// (upstream rotated), so re-probe with our own context.
+		bestIP, ok = s.prober.pickBest(ctx, host, pref, ips, checks)
+		if ok {
+			key := bestIP.String()
+			s.cache.Set(host, qtype, key, time.Now())
+			speedcheckDebugf("pickBest ok host=%s qtype=%d ip=%s", host, qtype, key)
+			rrs, _ := candRRs(cands, key)
+			return append(preserved, rrs...)
+		}
 	}
 
 	speedcheckDebugf("pickBest failed host=%s qtype=%d ips=%d", host, qtype, len(ips))
@@ -469,7 +579,8 @@ func (s *SpeedCheck) selectFastestWith(ctx context.Context, host string, qtype u
 			if ip.To4() == nil {
 				key := ip.String()
 				speedcheckDebugf("fallback pick first v6 host=%s qtype=%d ip=%s", host, qtype, key)
-				return append(preserved, rrByIP[key]...)
+				rrs, _ := candRRs(cands, key)
+				return append(preserved, rrs...)
 			}
 		}
 	}
@@ -477,18 +588,22 @@ func (s *SpeedCheck) selectFastestWith(ctx context.Context, host string, qtype u
 		if ip.To4() != nil {
 			key := ip.String()
 			speedcheckDebugf("fallback pick first v4 host=%s qtype=%d ip=%s", host, qtype, key)
-			return append(preserved, rrByIP[key]...)
+			rrs, _ := candRRs(cands, key)
+			return append(preserved, rrs...)
 		}
 	}
 	ip := ips[rand.IntN(len(ips))]
 	key := ip.String()
 	speedcheckDebugf("fallback pick random host=%s qtype=%d ip=%s", host, qtype, key)
-	return append(preserved, rrByIP[key]...)
+	rrs, _ := candRRs(cands, key)
+	return append(preserved, rrs...)
 }
 
-// pickBestAcrossFamilies collects AAAA IPs from the answer, fetches A records
-// from upstream, then races all IPs. Returns the winning IP.
-func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aaaaAnswer []dns.RR, r *dns.Msg, w dns.ResponseWriter) (net.IP, bool) {
+// pickBestAcrossFamilies collects AAAA IPs from the answer, adds the A records
+// provided by fetchA, then races all IPs. Returns the winning IP.
+// fetchA is only called when the AAAA answer has candidates, so a v6-less
+// answer does not wait for the prefetched A query.
+func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aaaaAnswer []dns.RR, fetchA func() []dns.RR) (net.IP, bool) {
 	var ips []net.IP
 	for _, rr := range aaaaAnswer {
 		if a, ok := rr.(*dns.AAAA); ok {
@@ -501,28 +616,13 @@ func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aa
 		return nil, false
 	}
 
-	if r == nil || len(r.Question) == 0 {
-		speedcheckDebugf("winner-race missing request host=%s", host)
-		return nil, false
-	}
-
-	reqA := r.Copy()
-	reqA.Question[0].Qtype = dns.TypeA
-
-	cw := newCaptureWriter(w)
-	ctxA, cancelA := context.WithTimeout(ctx, s.cfg.timeout)
-	defer cancelA()
-	rcode, _ := plugin.NextOrFailure(s.Name(), s.Next, ctxA, cw, reqA)
-	if cw.Msg == nil || rcode != dns.RcodeSuccess || cw.Msg.Rcode != dns.RcodeSuccess {
-		speedcheckDebugf("winner-race upstream A failed host=%s rcode=%d msg=%v", host, rcode, cw.Msg != nil)
-		return nil, false
-	}
-
 	hasV4 := false
-	for _, rr := range cw.Msg.Answer {
-		if a, ok := rr.(*dns.A); ok && a.A != nil {
-			hasV4 = true
-			ips = append(ips, a.A)
+	if fetchA != nil {
+		for _, rr := range fetchA() {
+			if a, ok := rr.(*dns.A); ok && a.A != nil {
+				hasV4 = true
+				ips = append(ips, a.A)
+			}
 		}
 	}
 	if !hasV4 {
@@ -548,7 +648,43 @@ func (s *SpeedCheck) pickBestAcrossFamilies(ctx context.Context, host string, aa
 	return nil, false
 }
 
+// addrCand groups the address records of one IP. A short slice is cheaper
+// than a map for the handful of addresses a typical answer carries.
+type addrCand struct {
+	key string
+	rrs []dns.RR
+}
+
+func addCandidate(cands []addrCand, key string, rr dns.RR) []addrCand {
+	for i := range cands {
+		if cands[i].key == key {
+			cands[i].rrs = append(cands[i].rrs, rr)
+			return cands
+		}
+	}
+	return append(cands, addrCand{key: key, rrs: []dns.RR{rr}})
+}
+
+func candRRs(cands []addrCand, key string) ([]dns.RR, bool) {
+	for i := range cands {
+		if cands[i].key == key {
+			return cands[i].rrs, true
+		}
+	}
+	return nil, false
+}
+
 func (s *SpeedCheck) dropAAAA(answer []dns.RR) []dns.RR {
+	drop := false
+	for _, rr := range answer {
+		if _, ok := rr.(*dns.AAAA); ok {
+			drop = true
+			break
+		}
+	}
+	if !drop {
+		return answer
+	}
 	out := make([]dns.RR, 0, len(answer))
 	for _, rr := range answer {
 		if _, ok := rr.(*dns.AAAA); ok {
@@ -560,6 +696,16 @@ func (s *SpeedCheck) dropAAAA(answer []dns.RR) []dns.RR {
 }
 
 func (s *SpeedCheck) dropA(answer []dns.RR) []dns.RR {
+	drop := false
+	for _, rr := range answer {
+		if _, ok := rr.(*dns.A); ok {
+			drop = true
+			break
+		}
+	}
+	if !drop {
+		return answer
+	}
 	out := make([]dns.RR, 0, len(answer))
 	for _, rr := range answer {
 		if _, ok := rr.(*dns.A); ok {
@@ -570,11 +716,66 @@ func (s *SpeedCheck) dropA(answer []dns.RR) []dns.RR {
 	return out
 }
 
+// answerForIP keeps the non-address records plus the address records of ip,
+// dropping the other candidates of the queried family. Returns nil when ip has
+// no record in answer.
+func answerForIP(answer []dns.RR, ip net.IP, qtype uint16) []dns.RR {
+	out := make([]dns.RR, 0, len(answer))
+	matched := false
+	for _, rr := range answer {
+		switch a := rr.(type) {
+		case *dns.A:
+			if qtype == dns.TypeA || qtype == dns.TypeANY {
+				if a.A.Equal(ip) {
+					out = append(out, rr)
+					matched = true
+				}
+				continue
+			}
+		case *dns.AAAA:
+			if qtype == dns.TypeAAAA || qtype == dns.TypeANY {
+				if a.AAAA.Equal(ip) {
+					out = append(out, rr)
+					matched = true
+				}
+				continue
+			}
+		default:
+			out = append(out, rr)
+		}
+	}
+	if !matched {
+		return nil
+	}
+	return out
+}
 
 func (s *SpeedCheck) findOverride(host string) (hostOverride, bool) {
 	if ov, ok := s.cfg.hostOverrides[host]; ok {
 		return ov, true
 	}
+	if s.cfg.hasWildcardRules {
+		// Wildcard rules are stored without the "*." prefix, so matching only
+		// needs to check the host and its parent suffixes; no "full."+host key
+		// is built per label.
+		if ov, ok := s.cfg.wildcardOverrides[host]; ok {
+			return ov, true
+		}
+		for {
+			dot := strings.IndexByte(host, '.')
+			if dot < 0 {
+				break
+			}
+			host = host[dot+1:]
+			if ov, ok := s.cfg.wildcardOverrides[host]; ok {
+				return ov, true
+			}
+		}
+		return hostOverride{}, false
+	}
+
+	// Fallback for configs assembled without parse (tests, embedders):
+	// wildcard rules sit in hostOverrides under their "*." key.
 	for {
 		if ov, ok := s.cfg.hostOverrides["*."+host]; ok {
 			return ov, true
